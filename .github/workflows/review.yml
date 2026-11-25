@@ -1,0 +1,414 @@
+# Gate G3 (review part): two independent AI reviews on every PR, run by agents that
+# did not write the code.
+#   ai-review        - spec conformance, test honesty, correctness, project rules
+#                      (instructions: .github/review/REVIEWER.md)
+#   security-review  - a security-only review of the diff: Anthropic's Claude Code security review
+#                      with ANTHROPIC_API_KEY, or a Claude session following
+#                      .github/review/SECURITY-REVIEWER.md with CLAUDE_CODE_OAUTH_TOKEN
+#
+# Results are published as commit statuses named "ai-review" and "security-review".
+# Branch protection on `main` requires both. Only two things can turn them green:
+# a passing review, or the owner adding the PR label `ai-review-overruled` (only the login that is
+# `product_owner_github` or one of `backup_approvers_github` in haam.config.json on the base branch, never a bot;
+# anyone else's is ignored).
+# The files that steer the reviewers (AGENTS.md, CLAUDE.md and its imports, nested AGENTS.md and CLAUDE.md, .agents/,
+# .claude/, docs/process/GATES.md) are the base branch's in both review jobs: a PR's changes to them are in
+# its diff, never in the instructions of the review that judges it.
+# (Statuses are used instead of job results because a skipped job counts as passing.)
+#
+# Needs one repository secret: ANTHROPIC_API_KEY (billed per review, separate from Claude
+# subscriptions) or CLAUDE_CODE_OAUTH_TOKEN (your Claude plan; create it with `claude setup-token`).
+# Both reviews work with either. The review instructions are always read from the base branch,
+# not from the PR (which its author controls). Docs-only PRs pass without calling Claude.
+name: Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+
+concurrency:
+  group: review-${{ github.event.pull_request.number }}-${{ github.event.action == 'labeled' && 'label' || 'code' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  statuses: write
+  id-token: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  PR: ${{ github.event.pull_request.number }}
+  SHA: ${{ github.event.pull_request.head.sha }}
+
+jobs:
+  scope:
+    name: review scope
+    # No runner is started for draft PRs (reviewed once, when marked ready) or for labels other than the
+    # overrule label (and, when reviews run locally, the human-review label, which brings them back here).
+    if: >-
+      (github.event.action != 'labeled' || github.event.label.name == 'ai-review-overruled' ||
+       ((vars.HAAM_REVIEW == 'local' || vars.HAAM_REVIEW == 'protected-only') && github.event.label.name == 'human-review')) &&
+      (github.event.action == 'labeled' || !github.event.pull_request.draft)
+    runs-on: ${{ vars.HAAM_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - id: decide
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          REVIEW_MODE: ${{ vars.HAAM_REVIEW }}
+          LABEL: ${{ github.event.label.name }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          SENDER_LOGIN: ${{ github.event.sender.login }}
+          SENDER_TYPE: ${{ github.event.sender.type }}
+        run: |
+          status() {  # context state description
+            gh api "repos/$REPO/statuses/$SHA" -f context="$1" -f state="$2" -f description="$3" >/dev/null
+          }
+          both() { status ai-review "$1" "$2"; status security-review "$1" "$2"; }
+          labels=$(gh pr view "$PR" -R "$REPO" --json labels -q '.labels[].name')
+
+          # >>> owner-only labels
+          # ai-review-overruled counts only from the owner's login or a backup approver's: product_owner_github and
+          # backup_approvers_github in haam.config.json on the base branch, compared without regard to case, never a
+          # bot. With no owner there, it never counts.
+          owner_logins=$(gh api "repos/$REPO/contents/haam.config.json?ref=$BASE_REF" --jq .content 2>/dev/null | base64 -d 2>/dev/null \
+            | jq -r 'def l: if type == "string" then ascii_downcase | ltrimstr("@") else "" end;
+                     if ((.product_owner_github // "") | l) == "" then empty
+                     else ([.product_owner_github] + ((.backup_approvers_github // []) | if type == "array" then . else [] end))
+                          | map(l) | map(select(. != "")) | .[] end' 2>/dev/null || true)
+          is_owner() {  # login type
+            [ -n "$owner_logins" ] && [ -n "$1" ] && [ "$2" != "Bot" ] || return 1
+            case "$1" in *"[bot]") return 1 ;; esac
+            printf '%s\n' "$owner_logins" | grep -qxF -- "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+          }
+          # Whether the owner added the overrule label: the sender while that label event is handled, else the actor of
+          # the latest `labeled` event for it. Sets overruled_by.
+          overruled_by=""
+          overruled_by_owner() {
+            local who
+            if [ "$EVENT_ACTION" = "labeled" ] && [ "$LABEL" = "ai-review-overruled" ]; then
+              overruled_by="$SENDER_LOGIN"; is_owner "$SENDER_LOGIN" "$SENDER_TYPE"; return
+            fi
+            who=$(gh api "repos/$REPO/issues/$PR/events" --paginate --jq '.[] | select(.event == "labeled" and .label.name == "ai-review-overruled") | "\(.actor.login) \(.actor.type)"' | tail -n 1 || true)
+            overruled_by="${who% *}"
+            [ -n "$who" ] && is_owner "${who% *}" "${who##* }"
+          }
+          # <<< owner-only labels
+
+          # Label events: only the overrule label matters (and, when reviews normally run locally, the
+          # human-review label, which brings the review back to GitHub); anything else changes nothing.
+          if [ "$EVENT_ACTION" = "labeled" ] && [ "$LABEL" != "human-review" ]; then
+            if [ "$LABEL" = "ai-review-overruled" ]; then
+              if overruled_by_owner; then
+                both success "Overruled by @$overruled_by (label ai-review-overruled)"
+              else
+                echo "::warning::ai-review-overruled added by @$SENDER_LOGIN, not the owner: ignored"
+              fi
+            fi
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          if echo "$labels" | grep -qx "ai-review-overruled"; then
+            if overruled_by_owner; then
+              both success "Overruled by @$overruled_by (label ai-review-overruled)"
+              echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            echo "::warning::ai-review-overruled is not the owner's: ignored, so the reviews run as if it were absent"
+          fi
+
+          if [ "$DRAFT" = "true" ]; then
+            both pending "Draft PR: reviewed when marked ready for review"
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          docs_only=true
+          for f in $(gh pr diff "$PR" -R "$REPO" --name-only); do
+            case "$f" in docs/*|*.md) ;; *) docs_only=false ;; esac
+          done
+          if [ "$docs_only" = "true" ]; then
+            both success "Docs-only change: no code review needed"
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # The project's settings (repository variable HAAM_REVIEW, from `haam.py settings`):
+          #   off            - no AI reviews at all
+          #   protected-only - only PRs that change a protected area are reviewed. Decided from the PR's files
+          #                    and the protected_paths on the base branch (with the base branch's own haam.py),
+          #                    not from a label, so the review can't be skipped before the gate labels the PR.
+          if [ "$REVIEW_MODE" = "off" ]; then
+            both success "Not needed: AI reviews are off in this project's settings"
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$REVIEW_MODE" = "protected-only" ] && ! echo "$labels" | grep -qx "human-review"; then
+            tmp="$RUNNER_TEMP/haam-scope"; mkdir -p "$tmp"
+            gh api "repos/$REPO/contents/tools/haam/haam.py?ref=$BASE_REF" --jq .content | base64 -d > "$tmp/haam_base.py" || true
+            gh api "repos/$REPO/contents/haam.config.json?ref=$BASE_REF" --jq .content | base64 -d > "$tmp/config.json" || true
+            gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' > "$tmp/files"
+            touched=$(python3 - "$tmp" <<'PY' || echo unknown
+          import importlib.util, json, sys, pathlib
+          d = pathlib.Path(sys.argv[1])
+          spec = importlib.util.spec_from_file_location("haam_base", d / "haam_base.py")
+          mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+          try:
+              pats = json.loads((d / "config.json").read_text()).get("protected_paths")
+          except Exception:
+              pats = None
+          files = (d / "files").read_text().splitlines()
+          hits = mod.protected_matches(pats or mod.DEFAULT_CONFIG["protected_paths"], files)
+          print(len(hits) if len(files) < 3000 else "unknown")
+          PY
+          )
+            if [ "$touched" = "0" ]; then
+              both success "Not needed: only protected areas get AI reviews in this project's settings"
+              echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          fi
+
+          # Reviews on the owner's computer (repository variable HAAM_REVIEW=local): wait for `haam.py review`,
+          # except for protected areas, which are always reviewed here.
+          if [ "$REVIEW_MODE" = "local" ] && ! echo "$labels" | grep -qx "human-review"; then
+            both pending "Waiting for the local review: python3 tools/haam/haam.py review --pr $PR"
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          both pending "Review in progress"
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+  ai-review:
+    name: ai review runner
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
+    runs-on: ${{ vars.HAAM_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Review instructions from the base branch
+        env:
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          mkdir -p .haam-review
+          git show "origin/$BASE:.github/review/REVIEWER.md" > .haam-review/REVIEWER.md 2>/dev/null \
+            || cp .github/review/REVIEWER.md .haam-review/REVIEWER.md   # first PR, before the kit is on main
+          rm -f review-verdict.txt review-comment.md   # only the reviewer writes these, never the PR
+          # >>> reviewer reads the base's steering files
+          # The files that steer the reviewer are the base branch's: every AGENTS.md and CLAUDE.md at any depth,
+          # every file the base's root CLAUDE.md imports, .agents/, .claude/, CLAUDE.local.md, .mcp.json and
+          # docs/process/GATES.md. A file the PR added is removed, one it deleted is put back; every other file keeps the
+          # PR's version. The kit's tests run both copies of this block, which must stay identical.
+          if ! git rev-parse --verify --quiet "origin/$BASE^{commit}" > /dev/null; then
+            echo "::error::origin/$BASE can't be read: the review can't start from the base branch's steering files"
+            exit 1
+          fi
+          if ! git cat-file -e "origin/$BASE:AGENTS.md" 2> /dev/null && ! git cat-file -e "origin/$BASE:CLAUDE.md" 2> /dev/null; then
+            echo "The base branch has neither AGENTS.md nor CLAUDE.md (the kit's first PR): the PR's steering files stay"
+          else
+            steer="$RUNNER_TEMP/haam-steering"
+            mkdir -p "$steer"
+            git show "origin/$BASE:CLAUDE.md" 2> /dev/null | sed -n 's/^@\([^[:space:]]\{1,\}\)[[:space:]]*$/\1/p' > "$steer/imports" || true
+            {
+              printf '%s\0' AGENTS.md CLAUDE.md CLAUDE.local.md .mcp.json docs/process/GATES.md
+              tr '\n' '\0' < "$steer/imports"
+              git ls-files -z
+              git ls-tree -r -z --name-only "origin/$BASE"
+            } | sort -zu > "$steer/paths"
+            restored=0
+            while IFS= read -r -d '' p; do
+              case "$p" in
+                AGENTS.md|CLAUDE.md|CLAUDE.local.md|.mcp.json|docs/process/GATES.md|*/AGENTS.md|*/CLAUDE.md|.agents|.agents/*|.claude|.claude/*) ;;
+                *) grep -qxF -- "$p" "$steer/imports" || continue ;;
+              esac
+              rm -rf -- "$p"
+              if git cat-file -e "origin/$BASE:$p" 2> /dev/null; then git checkout -q "origin/$BASE" -- "$p"; fi
+              restored=$((restored + 1))
+            done < "$steer/paths"
+            echo "Steering files from origin/$BASE: $restored paths"
+          fi
+          # <<< reviewer reads the base's steering files
+
+      - name: Independent review
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Either secret works: an API key (billed per review) or CLAUDE_CODE_OAUTH_TOKEN (your Claude plan;
+          # create it with `claude setup-token`).
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            Follow the instructions in .haam-review/REVIEWER.md exactly to review this pull request.
+            The files that steer agents and reviewers in this checkout (AGENTS.md, CLAUDE.md and the files it imports, any
+            nested AGENTS.md or CLAUDE.md, .agents/, .claude/, docs/process/GATES.md) are the base branch's, not the PR's. The PR's versions are in its diff: git diff origin/${{ github.event.pull_request.base.ref }}...HEAD -- <path>, or git show HEAD:<path>.
+            How to report (this wins over any older wording in those instructions, e.g. right after a kit update):
+            you can't post comments or reviews yourself. Write your review comment to the file review-comment.md
+            and the one-word verdict (APPROVE or CHANGES_REQUESTED) to review-verdict.txt, both in the workspace
+            root; the workflow posts them.
+          # TODO(setup): add --model to choose cost/quality; raise max-turns if reviews get cut short.
+          claude_args: >-
+            --max-turns 30
+            --allowedTools "Read,Glob,Grep,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*)"
+
+      - name: Publish the review and the verdict
+        if: always()
+        run: |
+          # The reviewer writes its comment to a file and this step posts it, so a verdict always comes with
+          # something to act on (posting from inside the session was being refused for long comments).
+          verdict=$(tr -d '[:space:]' < review-verdict.txt 2>/dev/null || echo MISSING)
+          posted=false
+          if [ -s review-comment.md ]; then
+            gh pr comment "$PR" -R "$REPO" --body-file review-comment.md && posted=true
+          fi
+          case "$verdict" in
+            APPROVE)           state=success; desc="AI review approved" ;;
+            CHANGES_REQUESTED) state=failure; desc="Changes requested: see PR comment (human can overrule)" ;;
+            *)                 state=error;   desc="Review did not finish: re-run, or human can overrule" ;;
+          esac
+          if [ "$posted" != "true" ] && [ "$state" = "failure" ]; then
+            state=error; desc="Review asked for changes but left no comment: re-run, or human can overrule"
+          fi
+          gh api "repos/$REPO/statuses/$SHA" -f context=ai-review -f state="$state" -f description="$desc" >/dev/null
+          echo "$verdict → $state"
+
+  security-review:
+    name: security review runner
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
+    runs-on: ${{ vars.HAAM_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 25
+    env:
+      # Which secret the repository has decides how the security review runs.
+      HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      HAS_PLAN_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Steering files from the base branch
+        env:
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # >>> reviewer reads the base's steering files
+          # The files that steer the reviewer are the base branch's: every AGENTS.md and CLAUDE.md at any depth,
+          # every file the base's root CLAUDE.md imports, .agents/, .claude/, CLAUDE.local.md, .mcp.json and
+          # docs/process/GATES.md. A file the PR added is removed, one it deleted is put back; every other file keeps the
+          # PR's version. The kit's tests run both copies of this block, which must stay identical.
+          if ! git rev-parse --verify --quiet "origin/$BASE^{commit}" > /dev/null; then
+            echo "::error::origin/$BASE can't be read: the review can't start from the base branch's steering files"
+            exit 1
+          fi
+          if ! git cat-file -e "origin/$BASE:AGENTS.md" 2> /dev/null && ! git cat-file -e "origin/$BASE:CLAUDE.md" 2> /dev/null; then
+            echo "The base branch has neither AGENTS.md nor CLAUDE.md (the kit's first PR): the PR's steering files stay"
+          else
+            steer="$RUNNER_TEMP/haam-steering"
+            mkdir -p "$steer"
+            git show "origin/$BASE:CLAUDE.md" 2> /dev/null | sed -n 's/^@\([^[:space:]]\{1,\}\)[[:space:]]*$/\1/p' > "$steer/imports" || true
+            {
+              printf '%s\0' AGENTS.md CLAUDE.md CLAUDE.local.md .mcp.json docs/process/GATES.md
+              tr '\n' '\0' < "$steer/imports"
+              git ls-files -z
+              git ls-tree -r -z --name-only "origin/$BASE"
+            } | sort -zu > "$steer/paths"
+            restored=0
+            while IFS= read -r -d '' p; do
+              case "$p" in
+                AGENTS.md|CLAUDE.md|CLAUDE.local.md|.mcp.json|docs/process/GATES.md|*/AGENTS.md|*/CLAUDE.md|.agents|.agents/*|.claude|.claude/*) ;;
+                *) grep -qxF -- "$p" "$steer/imports" || continue ;;
+              esac
+              rm -rf -- "$p"
+              if git cat-file -e "origin/$BASE:$p" 2> /dev/null; then git checkout -q "origin/$BASE" -- "$p"; fi
+              restored=$((restored + 1))
+            done < "$steer/paths"
+            echo "Steering files from origin/$BASE: $restored paths"
+          fi
+          # <<< reviewer reads the base's steering files
+
+      - name: Claude Code security review (API key)
+        id: security
+        if: env.HAS_API_KEY == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-security-review@0c6a49f1fa56a1d472575da86a94dbc1edb78eda   # main as of 2026-02-11
+        with:
+          claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          comment-pr: true
+          exclude-directories: "node_modules,vendor,dist,build,docs"
+          # Optional: project-specific rules and known false positives
+          # custom-security-scan-instructions: .github/review/security-rules.md
+          # false-positive-filtering-instructions: .github/review/security-false-positives.md
+
+      - name: Security instructions from the base branch
+        if: env.HAS_API_KEY != 'true' && env.HAS_PLAN_TOKEN == 'true'
+        env:
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          mkdir -p .haam-review
+          for f in SECURITY-REVIEWER.md REVIEWER.md; do
+            git show "origin/$BASE:.github/review/$f" > ".haam-review/$f" 2>/dev/null \
+              || cp ".github/review/$f" ".haam-review/$f"   # first PR, before the kit is on main
+          done
+          rm -f security-findings.txt security-comment.md   # only the reviewer writes these, never the PR
+
+      - name: Security review on the Claude plan (CLAUDE_CODE_OAUTH_TOKEN)
+        id: plan
+        if: env.HAS_API_KEY != 'true' && env.HAS_PLAN_TOKEN == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            Follow the instructions in .haam-review/SECURITY-REVIEWER.md exactly to review this pull request.
+            Its references to .github/review/REVIEWER.md mean .haam-review/REVIEWER.md.
+            The files that steer agents and reviewers in this checkout (AGENTS.md, CLAUDE.md and the files it imports, any
+            nested AGENTS.md or CLAUDE.md, .agents/, .claude/, docs/process/GATES.md) are the base branch's, not the PR's. The PR's versions are in its diff: git diff origin/${{ github.event.pull_request.base.ref }}...HEAD -- <path>, or git show HEAD:<path>.
+            How to report (this wins over any older wording in those instructions, e.g. right after a kit update):
+            you can't post comments yourself. If you found anything, write your comment to the file
+            security-comment.md; always write the number of findings, digits only, to security-findings.txt; both
+            in the workspace root. The workflow posts them.
+          claude_args: >-
+            --max-turns 30
+            --allowedTools "Read,Glob,Grep,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*)"
+
+      - name: Publish result
+        if: always()
+        env:
+          OUTCOME: ${{ steps.security.outcome }}
+          FINDINGS: ${{ steps.security.outputs.findings-count }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        run: |
+          if [ "$HAS_API_KEY" != "true" ]; then
+            if [ "$HAS_PLAN_TOKEN" != "true" ]; then
+              OUTCOME=missing
+            else
+              OUTCOME=$PLAN_OUTCOME
+              FINDINGS=$(tr -cd '0-9' < security-findings.txt 2>/dev/null || true)
+              if [ -s security-comment.md ]; then
+                gh pr comment "$PR" -R "$REPO" --body-file security-comment.md || FINDINGS=""
+              elif [ -n "$FINDINGS" ] && [ "$FINDINGS" != "0" ]; then
+                FINDINGS=""   # findings with nothing to read count as a review that didn't finish
+              fi
+            fi
+          fi
+          if [ "$OUTCOME" = "missing" ]; then
+            state=error; desc="No reviewer secret: add ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN"
+          elif [ "$OUTCOME" != "success" ] || [ -z "$FINDINGS" ]; then
+            state=error; desc="Security review did not finish: re-run, or human can overrule"
+          elif [ "$FINDINGS" = "0" ]; then
+            state=success; desc="No security findings"
+          else
+            state=failure; desc="$FINDINGS security finding(s): see PR comments (human can overrule)"
+          fi
+          gh api "repos/$REPO/statuses/$SHA" -f context=security-review -f state="$state" -f description="$desc" >/dev/null
+          echo "$state: $desc"

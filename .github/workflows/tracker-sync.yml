@@ -1,0 +1,64 @@
+# Keeps the GitHub Projects board in step with pull requests (only when
+# haam.config.json says "tracker": "github"; does nothing for Linear projects,
+# where Linear's own GitHub integration moves issues).
+#   PR opened / ready for review → linked issues that are In Progress move to "In Review"
+#   PR merged                    → linked issues that are In Progress, In Review or UAT move to "Deploying"
+# Never moved: epics (their status follows their sub-issues), issues a PR only mentions (in Backlog, Ready…),
+# and anything linked from a docs-only PR (an epic brief, a split spec) or a spike branch.
+# New issues are put on the board by the board's own "Auto-add to project" workflow (free, no
+# Actions minutes) and by `haam.py issue create`, not by this workflow.
+# A PR links an issue with "Refs #123" in its description (or a branch named 123-...).
+# Needs the repository secret HAAM_PROJECT_TOKEN: a classic token with the
+# 'project' scope (and 'repo' if the repository is private). The built-in token
+# can't edit project boards.
+name: Tracker sync
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tracker-sync-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # A draft PR moves its issue when it's marked ready, not when it's opened. A PR closed without merging
+    # changes nothing on the board, so it doesn't start a runner either.
+    if: >-
+      (github.event.action != 'opened' || !github.event.pull_request.draft) &&
+      (github.event.action != 'closed' || github.event.pull_request.merged)
+    runs-on: ${{ vars.HAAM_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Which tracker?
+        id: tracker
+        run: |
+          t=$(python3 -c "import json; print(json.load(open('haam.config.json')).get('tracker', ''))" 2>/dev/null || true)
+          echo "name=$t" >> "$GITHUB_OUTPUT"
+          echo "Tracker: ${t:-not configured}"
+
+      - name: Move issues linked to this pull request
+        if: steps.tracker.outputs.name == 'github'
+        env:
+          GH_TOKEN: ${{ secrets.HAAM_PROJECT_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
+          MERGED: ${{ github.event.pull_request.merged }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::HAAM_PROJECT_TOKEN isn't set, so board cards won't move automatically. See docs/process/TRACKER.md."
+            exit 0
+          fi
+          if [ "$ACTION" = "closed" ]; then
+            if [ "$MERGED" != "true" ]; then echo "Closed without merging: nothing to do"; exit 0; fi
+            event=merged
+          else
+            event=opened
+          fi
+          python3 tools/haam/haam.py sync-pr --pr "$PR" --event "$event"

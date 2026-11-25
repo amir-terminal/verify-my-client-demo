@@ -1,0 +1,82 @@
+# Gate G3 (automated part): every PR must pass `make check`.
+# Branch protection on `main` requires the status check named "ci".
+#
+# Keeping CI minutes down:
+#   - Docs-only PRs (docs/**, *.md) pass in seconds without running the checks.
+#   - `make check` gets the list of changed files in $CI_CHANGED_FILES, so a project can run only the
+#     parts a PR touches (e.g. skip the mobile app's tests when only the backend changed).
+#   - main is not re-checked after every merge; a full run happens nightly (and on demand) instead.
+#   - A newer push to the same PR cancels the older run.
+#   - Draft PRs don't run at all: agents open their PR as a draft, run `make check` locally while they work,
+#     and mark it ready when done. That's when CI runs, once.
+#   - Runner: GitHub's ubuntu-24.04, or your own machine if the repository variable HAAM_RUNNER is set
+#     (`haam.py settings --set runner=self-hosted --apply`).
+#   - The project's settings decide whether PRs run this at all (repository variable HAAM_CI, from
+#     `haam.py settings`): every-pr (default) · local (the owner's `haam.py local-ci` posts `ci-local` instead)
+#     · off. The nightly run follows HAAM_NIGHTLY (on by default).
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "17 3 * * *"   # nightly full run on main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci
+    if: >-
+      (github.event_name == 'pull_request' && !github.event.pull_request.draft &&
+        vars.HAAM_CI != 'local' && vars.HAAM_CI != 'off') ||
+      (github.event_name == 'schedule' && vars.HAAM_NIGHTLY != 'off') ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.HAAM_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: What changed?
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          : > "$RUNNER_TEMP/changed-files"
+          if [ "$EVENT" = "pull_request" ]; then
+            git diff --name-only "$BASE"...HEAD > "$RUNNER_TEMP/changed-files"
+          fi
+          echo "CI_CHANGED_FILES=$RUNNER_TEMP/changed-files" >> "$GITHUB_ENV"
+          if [ -s "$RUNNER_TEMP/changed-files" ] && ! grep -qvE '^docs/|\.md$' "$RUNNER_TEMP/changed-files"; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "Docs-only change: checks not needed."
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Changed files: $(wc -l < "$RUNNER_TEMP/changed-files") (empty list = full run)"
+          fi
+
+      # Python runtime + uv (reads .python-version; uv installs that Python).
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv python install
+      - name: Install dependencies
+        if: steps.changes.outputs.docs_only != 'true'
+        run: make setup
+
+      - name: Lint, typecheck, unit tests, build
+        if: steps.changes.outputs.docs_only != 'true'
+        run: make check
+        env:
+          CI: "true"
+          # Tests must use synthetic data and mocked external services.
+          # Never put production secrets here.

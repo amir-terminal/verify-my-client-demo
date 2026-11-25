@@ -1,0 +1,375 @@
+# Gate G4 enforcement: a PR can only merge to main when a human has passed UAT
+# (label `uat-passed`) or a human has overridden the gate (label `gate-override`
+# plus a PR comment starting with "OVERRIDE:").
+# The no-UAT lane: when the owner marked every (open) issue a PR is for `uat:skip` (their decision, made
+# when triaging or approving the spec) and the PR carries `uat:skip` too, the gate passes without a test.
+# On GitHub Projects it also turns on auto-merge, so the PR merges by itself once CI and both AI reviews
+# pass, and turns it off again if the lane stops applying (the owner removes the label, `human-review` is
+# added, the title names another issue). Never for PRs labelled `human-review` (protected areas). Auto-merge
+# needs the HAAM_PROJECT_TOKEN secret (a merge by the workflow's own token wouldn't start the deploy). On
+# Linear the gate can't read the issue, so it trusts the PR label but never auto-merges: the owner ships it.
+# Nor with local AI reviews (HAAM_REVIEW=local): the owner ships those lane PRs too.
+# A pass belongs to the code that was tested: a push after it removes `uat-passed`,
+# unless the new head carries the owner's `uat` commit status (`haam.py publish`
+# posts it on exactly the commit they tested). Drafts included.
+# Docs-only PRs (docs/**, *.md) are exempt. Prototypes never merge, whatever the labels: not a spike/ branch, and
+# not files under prototypes/. Code kept from a prototype reaches main only through /spec and a normal branch, and
+# never takes the no-UAT lane (its commits say "spike:").
+# Branch protection on `main` requires the status check named "release-gate".
+# ⛔ GITHUB RUNS main's copy OF THIS FILE: it triggers on `pull_request_target`, so a PR that edits it is still judged
+# by the gate on main, never by its own edited copy. It checks out nothing and runs nothing from the PR; never add a
+# checkout, a local action or the PR's head as a ref here (the kit's tests fail if one appears).
+# ⛔ ONLY THE OWNER'S WORD COUNTS: `uat-passed`, `gate-override` and its `OVERRIDE:` comment, and the issue's `uat:skip`
+# count only when the owner (`product_owner_github` in haam.config.json on main) or a backup approver
+# (`backup_approvers_github`) added or wrote them, never a bot; with no owner there, none counts. While agents sign in
+# to GitHub as the owner, GitHub cannot tell the owner from an agent: this stops bots, workflow tokens and every other
+# account, not an agent that ignores AGENTS.md.
+# The changeover: the PR that first brings this file is judged before main has it, and main's old copy knows no
+# `pull_request_target`, so that PR would get no gate at all. So `haam.py update` keeps the lines between the
+# `haam:changeover` markers only while main's copy does not listen to `pull_request_target`: a `pull_request` trigger,
+# whose run (the PR's own copy) posts `release-gate` only in that case, and nothing once main's copy decides. Run
+# `haam.py update` again once that copy is on main: it removes them, so a PR can no longer run its own copy.
+name: Gates
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review, edited]
+  # >>> haam:changeover
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review, edited]
+  # <<< haam:changeover
+  issue_comment:
+    types: [created, edited]
+  issues:
+    types: [labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write   # remove a stale uat-passed label
+  issues: read
+  statuses: write
+
+jobs:
+  evaluate:
+    # One evaluation per PR (or issue) at a time, so two quick pushes don't race. At job level, so events the
+    # `if` below skips never join the group and can't push a pending re-check out of it.
+    concurrency:
+      group: gates-${{ github.event_name == 'issues' && 'issue-' || '' }}${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+    # The job itself always succeeds; the result is published as the commit
+    # status "release-gate", which branch protection requires. This keeps it
+    # correct for comment events too (which don't run against the PR commit).
+    name: evaluate release gate
+    # Only events that can change the result start a runner: code pushes, a changed title, the gate labels
+    # (on the PR, or uat:skip on an issue), and override comments on a PR. Drafts only when a push may make
+    # a pass stale.
+    if: >-
+      ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && github.event.pull_request.draft &&
+        github.event.action == 'synchronize' &&
+        contains(github.event.pull_request.labels.*.name, 'uat-passed')) ||
+      ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && !github.event.pull_request.draft &&
+        (contains(fromJSON('["opened", "reopened", "synchronize", "ready_for_review"]'), github.event.action) ||
+         (github.event.action == 'edited' && github.event.changes.title) ||
+         ((github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+          contains(fromJSON('["uat-passed", "gate-override", "uat:skip", "human-review"]'), github.event.label.name)))) ||
+      (github.event_name == 'issues' && github.event.label.name == 'uat:skip') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+        (startsWith(github.event.comment.body, 'OVERRIDE') || startsWith(github.event.comment.body, 'EMERGENCY BYPASS')))
+    runs-on: ${{ vars.HAAM_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - name: Check UAT / override
+        id: gate
+        uses: actions/github-script@v7
+        env:
+          REVIEW_MODE: ${{ vars.HAAM_REVIEW }}
+          CI_MODE: ${{ vars.HAAM_CI }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+
+            // >>> haam:changeover (haam.py update removes it, with the `pull_request` trigger, once main's copy has this file)
+            // A `pull_request` run is the PR's own copy of this file. It decides release-gate only while main's copy
+            // does not listen to `pull_request_target` (the PR that brings this file); once main's does, main's run
+            // decides and this one posts nothing. If main's copy can't be read, it posts nothing either: never two.
+            if (context.eventName === 'pull_request') {
+              let mainDecides = true;
+              try {
+                const { data } = await github.rest.repos.getContent({ owner, repo, path: '.github/workflows/gates.yml' });
+                mainDecides = /^ {2}pull_request_target:\s*$/m.test(Buffer.from(data.content, 'base64').toString());
+              } catch (e) {
+                core.warning(`Couldn't read main's copy of gates.yml (${e.message}): this run, the PR's own copy, posts nothing`);
+              }
+              if (mainDecides) {
+                core.info("main's copy of gates.yml runs on pull_request_target and decides release-gate: this run posts nothing");
+                return;
+              }
+            }
+            // <<< haam:changeover
+
+            // Settings come from the default branch, never from the PR (which its author controls).
+            let tracker = '';
+            let uatMode = 'owner-decides';   // the project's setting: owner-decides | always | bugs-skip
+            let protectedPaths = ['AGENTS.md', 'CLAUDE.md', '.agents/**', '.claude/**', '.cursor/**', '.codex/**', '.grok/**',
+              '.gemini/**', '.github/**', 'tools/haam/**', 'haam.config.json', '.mcp.json', 'Makefile', 'scripts/**',
+              '.githooks/**', '.gitleaks.toml', '.gitleaksignore'];
+            let settings = {};
+            try {
+              const { data } = await github.rest.repos.getContent({ owner, repo, path: 'haam.config.json' });
+              const cfg = JSON.parse(Buffer.from(data.content, 'base64').toString());
+              settings = cfg;
+              tracker = cfg.tracker || '';
+              uatMode = cfg.uat || 'owner-decides';
+              if (Array.isArray(cfg.protected_paths)) protectedPaths = cfg.protected_paths;
+            } catch (e) { core.warning(`Couldn't read haam.config.json: ${e.message}`); }
+
+            // Path patterns (same rules as haam.py protected): ** any folders, * within one folder, ? one character.
+            const globRe = (p) => {
+              // A leading ./ or / is ignored; a trailing / means everything inside; a plain name is that file or folder.
+              p = p.trim().replace(/^(\.\/|\/)+/, '');
+              if (p.endsWith('/')) p += '**';
+              if (!/[*?]/.test(p)) return new RegExp('^' + p.replace(/[.+^${}()|[\]\\]/g, '\\$&') + '(?:/.*)?$');
+              let out = '';
+              for (let i = 0; i < p.length;) {
+                if (p.startsWith('**/', i)) { out += '(?:.*/)?'; i += 3; }
+                else if (p.startsWith('**', i)) { out += '.*'; i += 2; }
+                else if (p[i] === '*') { out += '[^/]*'; i += 1; }
+                else if (p[i] === '?') { out += '[^/]'; i += 1; }
+                else { out += p[i].replace(/[.+^${}()|[\]\\]/g, '\\$&'); i += 1; }
+              }
+              return new RegExp('^' + out + '$');
+            };
+            const protectedRes = protectedPaths.map(globRe);
+
+            // >>> owner-only labels
+            // The owner's word (uat-passed, gate-override and its comment, the issue's uat:skip) counts only from the
+            // owner's login (product_owner_github in haam.config.json on the default branch) or a backup approver's
+            // (backup_approvers_github), compared without regard to case, and never from a bot. With no owner there,
+            // nothing counts (fail closed).
+            const login = (v) => typeof v === 'string' ? v.trim().replace(/^@/, '').toLowerCase() : '';
+            const ownerLogin = login(settings.product_owner_github);
+            const ownerLogins = ownerLogin === '' ? [] : [ownerLogin].concat(
+              (Array.isArray(settings.backup_approvers_github) ? settings.backup_approvers_github : []).map(login).filter(Boolean));
+            const isBot = (user) => !user || user.type === 'Bot' || /\[bot\]$/i.test(user.login || '');
+            const isOwner = (user) => ownerLogins.length > 0 && !isBot(user) && ownerLogins.includes((user.login || '').toLowerCase());
+            const noOwner = 'No owner in haam.config.json on main: owner labels don\'t count';
+            // Who added label [name] to issue or PR [n]: the sender while that very label event is handled (the events
+            // API can lag a second behind it), else the actor of the latest `labeled` event for it.
+            const labelledBy = async (n, name) => {
+              const subject = context.payload.pull_request ? context.payload.pull_request.number
+                : context.payload.issue ? context.payload.issue.number : null;
+              if (context.payload.action === 'labeled' && context.payload.label && context.payload.label.name === name && subject === n) {
+                return context.payload.sender || null;
+              }
+              const events = await github.paginate(github.rest.issues.listEvents, { owner, repo, issue_number: n, per_page: 100 });
+              const last = events.filter(e => e.event === 'labeled' && e.label && e.label.name === name).pop();
+              return last ? last.actor : null;
+            };
+            // Whether [name] on [n] counts; when it is there and does not, why (the gate's description says it).
+            const ownerLabel = async (n, name, labels) => {
+              if (!labels.includes(name)) return { counts: false, why: '' };
+              if (ownerLogin === '') return { counts: false, why: noOwner };
+              const by = await labelledBy(n, name);
+              if (isOwner(by)) return { counts: true, by: by.login, why: '' };
+              const who = by ? by.login : 'unknown';
+              return { counts: false, by: who, why: `${name} was added by @${who}, not the owner or a backup approver in haam.config.json: it doesn't count` };
+            };
+            // <<< owner-only labels
+
+            // The issues a PR is for: its title ("#12 #13: …") and its branch ("12-…"); never its description.
+            const prIssues = (pr) => {
+              const ids = new Set();
+              const title = (pr.title.match(/^\s*((?:#\d+[\s,]*)+):/) || [])[1] || '';
+              for (const m of title.matchAll(/#(\d+)/g)) ids.add(Number(m[1]));
+              const b = pr.head.ref.match(/^(\d+)-/);
+              if (b) ids.add(Number(b[1]));
+              return ids;
+            };
+
+            // Which PRs to evaluate: this PR, or (uat:skip changed on an issue) the open PRs for that issue.
+            let numbers = [];
+            if (context.eventName === 'issues') {
+              const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+              numbers = open.filter(p => prIssues(p).has(context.payload.issue.number)).map(p => p.number);
+            } else {
+              numbers = [context.payload.pull_request ? context.payload.pull_request.number : context.payload.issue.number];
+            }
+
+            const enable = [], disable = [];
+            for (const number of numbers) {
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+              let labels = pr.labels.map(l => l.name);
+              const why = [];   // owner labels that are there and do not count, in the order found
+
+              // New commits after the owner's pass: the pass no longer covers the code, unless the new
+              // head is exactly the commit they tested (`uat` status from haam.py publish).
+              if (context.payload.action === 'synchronize' && labels.includes('uat-passed')) {
+                const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef,
+                  { owner, repo, ref: pr.head.sha });
+                const tested = statuses.some(s => s.context === 'uat' && s.state === 'success');
+                if (!tested) {
+                  labels = labels.filter(l => l !== 'uat-passed');   // the gate fails either way
+                  try {
+                    await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name: 'uat-passed' });
+                    await github.rest.issues.createComment({ owner, repo, issue_number: number,
+                      body: 'New commits after the UAT pass, so `uat-passed` was removed: the owner tests this version again (`/test`).' });
+                  } catch (e) {
+                    core.warning(`Couldn't remove uat-passed: ${e.message}`);   // e.g. removed already by a parallel run
+                  }
+                }
+              }
+
+              // Docs-only PRs are exempt.
+              const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: number });
+              const docsOnly = files.length > 0 && files.length < 3000 && files.every(f =>
+                [f.filename, f.previous_filename].filter(Boolean).every(n => n.startsWith('docs/') || n.endsWith('.md')));
+
+              // Protected areas are decided by the files the PR changes, not by a label anyone could leave off.
+              // A renamed file counts by its old path too, so moving something out of a protected folder is caught.
+              // GitHub lists at most 3000 files: a PR that big is treated as touching protected areas.
+              const paths = files.flatMap(f => [f.filename, f.previous_filename].filter(Boolean));
+              const touched = files.length >= 3000 ? ['(more than 3000 files)']
+                : paths.filter(f => protectedRes.some(r => r.test(f)));
+              if (touched.length && !labels.includes('human-review')) {
+                try {
+                  await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: ['human-review'] });
+                  labels.push('human-review');
+                  await github.rest.issues.createComment({ owner, repo, issue_number: number, body:
+                    'This PR changes protected areas (`protected_paths` in haam.config.json), so it needs a human code ' +
+                    'review and never takes the no-UAT lane: ' + touched.slice(0, 10).map(f => '`' + f + '`').join(', ') });
+                } catch (e) { core.warning(`Couldn't add human-review: ${e.message}`); }
+              }
+
+              // Prototypes: a spike branch, or files under prototypes/, never merge.
+              const spikeBranch = /^spike\//i.test(pr.head.ref);
+              const prototypeFiles = paths.filter(f => /^prototypes\//i.test(f));
+
+              // The no-UAT lane: every issue the PR is for is an open issue (not a PR) the owner marked uat:skip.
+              let lane = false;
+              let laneWhy = '';
+              let fromSpike = false;
+              if (!docsOnly && labels.includes('uat:skip')) {
+                const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: number });
+                fromSpike = commits.some(c => /^\S+:\s*spike:/i.test((c.commit && c.commit.message) || ''));
+              }
+              if (!docsOnly && labels.includes('uat:skip')) {
+                if (fromSpike) {
+                  laneWhy = 'Built from a prototype (spike commits): needs the owner\'s test';
+                } else if (uatMode === 'always') {
+                  laneWhy = 'This project tests every change (setting uat: always): needs UAT';
+                } else if (touched.length) {
+                  laneWhy = `uat:skip never applies to protected areas (${touched.slice(0, 3).join(', ')}): needs UAT`;
+                } else if (labels.includes('human-review')) {
+                  laneWhy = 'uat:skip never applies to protected areas (human-review): needs UAT';
+                } else if (tracker === 'github') {
+                  const ids = prIssues(pr);
+                  lane = ids.size > 0;
+                  if (!lane) laneWhy = 'uat:skip: no issue found in the title or branch';
+                  for (const n of ids) {
+                    let iss = null;
+                    try { iss = (await github.rest.issues.get({ owner, repo, issue_number: n })).data; } catch (e) { }
+                    const names = iss ? iss.labels.map(l => typeof l === 'string' ? l : l.name) : [];
+                    // Only the owner's mark counts (with uat: bugs-skip, /triage adds it to bugs by default): a
+                    // stream label is set by whoever files the issue, agents included.
+                    const marked = iss && !iss.pull_request && iss.state === 'open' && n !== number &&
+                      names.includes('uat:skip');
+                    if (!marked) {
+                      lane = false;
+                      laneWhy = `uat:skip on the PR, but #${n} isn't an open issue the owner marked uat:skip`;
+                    } else {
+                      // The owner's mark is the owner's: added by the owner's (or a backup approver's) login, never a bot.
+                      const skip = await ownerLabel(n, 'uat:skip', names);
+                      if (!skip.counts) {
+                        lane = false;
+                        laneWhy = ownerLogin === '' ? noOwner : `uat:skip on #${n} was added by @${skip.by}, not the owner: needs UAT`;
+                      }
+                    }
+                  }
+                } else {
+                  lane = true;   // Linear: the agent copies uat:skip from the Linear issue (the gate can't read Linear)
+                }
+              }
+
+              // The owner's labels, each counted only from the owner's (or a backup approver's) login.
+              const passed = await ownerLabel(number, 'uat-passed', labels);
+              if (passed.why) why.push(passed.why);
+              const overridden = await ownerLabel(number, 'gate-override', labels);
+              if (overridden.why) why.push(overridden.why);
+
+              let state = 'failure';
+              let description = why[0] || laneWhy || 'Waiting for UAT: needs label uat-passed (or gate-override with reason)';
+
+              if (spikeBranch) {
+                description = 'Spike branch: prototypes never merge. Take it through /spec onto a normal branch';
+              } else if (prototypeFiles.length) {
+                description = `prototypes/ never merges (${prototypeFiles[0]}): move what you keep into the production code`;
+              } else if (docsOnly) {
+                state = 'success';
+                description = 'Docs-only change: UAT not required';
+              } else if (passed.counts) {
+                state = 'success';
+                description = `UAT passed (label by @${passed.by})`;
+              } else if (lane) {
+                state = 'success';
+                description = tracker === 'github'
+                  ? 'No UAT needed (uat:skip): merges once the checks and reviews pass'
+                  : 'No UAT needed (uat:skip): the owner ships it once the checks and reviews pass';
+              } else if (overridden.counts) {
+                const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: number });
+                // "OVERRIDE: <reason>", in capitals (also "OVERRIDE (Level 1, skip UAT) by @user: <reason>")
+                const matching = comments.filter(c =>
+                  /^\s*(OVERRIDE|EMERGENCY BYPASS)(\s*\([^)\n]{0,80}\))?(\s+by\s+[^:\n]{1,40})?:\s*\S/.test(c.body));
+                // And only the owner's (or a backup approver's) comment counts, never a bot's.
+                const reason = matching.find(c => isOwner(c.user));
+                if (reason) {
+                  state = 'success';
+                  description = `Gate overridden by ${reason.user.login}`;
+                } else if (matching.length) {
+                  description = `OVERRIDE comment by @${matching[0].user ? matching[0].user.login : 'unknown'} doesn't count: only the owner's or a backup approver's does`;
+                } else {
+                  description = 'gate-override label present but no "OVERRIDE: <reason>" comment';
+                }
+              }
+
+              // Post the status on the PR head commit so it works for comment and issue events too.
+              await github.rest.repos.createCommitStatus({
+                owner, repo, sha: pr.head.sha, state, description: description.slice(0, 140),
+                context: 'release-gate',
+              });
+              core.info(`#${number} release-gate → ${state}: ${description}`);
+
+              // The lane merges by itself (GitHub Projects only). Not when the AI reviews run on the owner's computer
+              // (HAAM_REVIEW=local): those results aren't tamper-proof, so the owner ships lane PRs themselves.
+              // Anything else that had auto-merge on loses it.
+              // Only when CI and both AI reviews really ran on GitHub (HAAM_CI every-pr, HAAM_REVIEW github): with
+              // local, reduced or no checks the owner ships lane PRs themselves.
+              const autoLane = lane && state === 'success' && tracker === 'github' && !pr.draft && !spikeBranch &&
+                ['', 'github'].includes(process.env.REVIEW_MODE || '') && ['', 'every-pr'].includes(process.env.CI_MODE || '');
+              if (autoLane && !pr.auto_merge) enable.push(number);
+              if (!autoLane && pr.auto_merge && !passed.counts && !overridden.counts) disable.push(number);
+            }
+            core.setOutput('enable', enable.join(' '));
+            core.setOutput('disable', disable.join(' '));
+
+      - name: Auto-merge for the no-UAT lane
+        if: steps.gate.outputs.enable != '' || steps.gate.outputs.disable != ''
+        env:
+          # The owner's token: a merge by the workflow's own token wouldn't start the deploy workflow.
+          GH_TOKEN: ${{ secrets.HAAM_PROJECT_TOKEN || github.token }}
+          HAS_TOKEN: ${{ secrets.HAAM_PROJECT_TOKEN != '' }}
+          ENABLE: ${{ steps.gate.outputs.enable }}
+          DISABLE: ${{ steps.gate.outputs.disable }}
+          REPO: ${{ github.repository }}
+        run: |
+          for n in $DISABLE; do
+            if gh pr merge "$n" --disable-auto -R "$REPO"; then echo "Auto-merge off for #$n (the lane no longer applies)"
+            else echo "::warning::Couldn't turn off auto-merge for #$n; release-gate is red, so it won't merge"; fi
+          done
+          if [ -n "$ENABLE" ] && [ "$HAS_TOKEN" != "true" ]; then
+            echo "::notice::No HAAM_PROJECT_TOKEN secret, so auto-merge stays off: ship it with haam.py ship --all"
+            exit 0
+          fi
+          for n in $ENABLE; do
+            if gh pr merge "$n" --auto --squash -R "$REPO"; then echo "Auto-merge on for #$n: it merges once every required check passes"
+            else echo "::warning::Couldn't turn on auto-merge for #$n (allow it with haam.py github --apply; the token needs the repo scope)"; fi
+          done

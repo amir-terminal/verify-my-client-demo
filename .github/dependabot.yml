@@ -1,0 +1,40 @@
+# Dependabot opens PRs for vulnerable or outdated dependencies.
+# Those PRs go through the same gates as any other change, and each one costs CI minutes and
+# your review time, so updates are monthly, grouped into one PR per ecosystem, at most 2 open.
+# Security fixes are separate: GitHub opens those as soon as an alert appears.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Python dependencies (uv.lock)
+  # - package-ecosystem: "npm"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "monthly"
+  #   open-pull-requests-limit: 2
+  #   groups:
+  #     npm:
+  #       patterns: ["*"]
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    groups:
+      uv:
+        patterns: ["*"]
+  # - package-ecosystem: "composer"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "monthly"
+  #   open-pull-requests-limit: 2
+  #   groups:
+  #     composer:
+  #       patterns: ["*"]
