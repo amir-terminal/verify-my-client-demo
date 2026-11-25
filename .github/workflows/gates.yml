@@ -98,7 +98,11 @@ jobs:
                 const { data } = await github.rest.repos.getContent({ owner, repo, path: '.github/workflows/gates.yml' });
                 mainDecides = /^ {2}pull_request_target:\s*$/m.test(Buffer.from(data.content, 'base64').toString());
               } catch (e) {
-                core.warning(`Couldn't read main's copy of gates.yml (${e.message}): this run, the PR's own copy, posts nothing`);
+                if (e.status === 404) {
+                  mainDecides = false;   // main has no gates.yml yet (the PR that brings it): this run decides
+                } else {
+                  core.warning(`Couldn't read main's copy of gates.yml (${e.message}): this run, the PR's own copy, posts nothing`);
+                }
               }
               if (mainDecides) {
                 core.info("main's copy of gates.yml runs on pull_request_target and decides release-gate: this run posts nothing");
