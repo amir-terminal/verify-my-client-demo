@@ -1,8 +1,8 @@
 {
   "product_name": "Verify My Client",
   "tracker": "github",
-  "github_project_owner": "",
-  "github_project_number": null,
+  "github_project_owner": "amir-terminal",
+  "github_project_number": 3,
   "team_key": "VMC",
   "linear_team_name": "Verify My Client",
   "github_repo": "amir-terminal/verify-my-client-demo",
