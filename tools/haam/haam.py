@@ -668,7 +668,9 @@ GATES_WORKFLOW = ".github/workflows/gates.yml"
 CHANGEOVER_NOTE = ("gates.yml: step 1 of 2 (it also listens to pull_request, so the PR that brings it gets a gate)",
                    "once this is on main, run haam.py update again: it removes that trigger, so a PR can't run its "
                    "own copy of the gate")
-CHANGEOVER_RE = re.compile(r"^[ \t]*(?:#|//) >>> haam:changeover.*\n.*?^[ \t]*(?:#|//) <<< haam:changeover.*\n",
+# [^\n]* (not .*) for the rest of each marker line: with re.S, .* runs past the line and the match swallows
+# everything from the first marker to the end of the file.
+CHANGEOVER_RE = re.compile(r"^[ \t]*(?:#|//) >>> haam:changeover[^\n]*\n.*?^[ \t]*(?:#|//) <<< haam:changeover[^\n]*\n",
                            re.M | re.S)
 LISTENS_TARGET_RE = re.compile(r"^ {2}pull_request_target:\s*$", re.M)
 
