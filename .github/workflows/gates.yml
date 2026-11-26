@@ -80,7 +80,7 @@ jobs:
     steps:
       - name: Check UAT / override
         id: gate
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           REVIEW_MODE: ${{ vars.HAAM_REVIEW }}
           CI_MODE: ${{ vars.HAAM_CI }}
