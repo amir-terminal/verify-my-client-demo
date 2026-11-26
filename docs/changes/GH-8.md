@@ -1,0 +1,1 @@
+- #8: A business can now create a verification request through the API, choosing which details it needs (name, over 18, confirmed address) with a demo key. Invalid requests are refused without storing anything or repeating what was sent.
