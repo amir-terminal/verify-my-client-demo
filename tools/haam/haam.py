@@ -1,0 +1,8905 @@
+#!/usr/bin/env python3
+"""
+HAAM setup tool: Human-Agent Agile Methodology.
+
+One tool that any coding agent (Claude Code, Cursor, Codex, Grok, ...) or human can
+run to adopt HAAM in a repository and to onboard new developers.
+
+    python3 tools/haam/haam.py <command> [options]
+
+Admin (first-time adoption and upgrades):
+    install   --target DIR     Copy the HAAM kit into a repository (never overwrites)
+    update    --target DIR     Upgrade a project to this kit version (keeps your customisations)
+    changeover [--apply]       Finish the release gate's move to main's copy (after the update that starts it)
+    config                     Create/update haam.config.json and apply team key + names
+    agents    [--apply]        Wire up Claude Code, Cursor, Codex, Grok, Gemini, Copilot
+    github    [--apply]        Labels, branch rules, required checks, production env, security
+    linear    [--apply]        Linear team, statuses and labels (needs a Linear API key)
+    github-project [--apply]   GitHub Projects board, statuses, priority, labels (tracker: github)
+    invite    --github USER [--linear-email EMAIL] [--apply]
+
+Agents, when the tracker is GitHub Projects:
+    issue create|view|list|stale|claim|release|status|priority|label|comment|close|link|unlink|children|edit|fields ...
+
+Testing and shipping (inside /test, after the human's verdict):
+    checkout-pr ISSUE | --back              Put a change on this machine to test it (its PR, or the agent's branch)
+    publish ISSUE --human                   Test-first: push the tested commit and open its PR (uat-passed)
+    ship ISSUE... | --all --human           Merge, approve the production deploy (one for several), wait, close (exit 2: run again)
+    ship --all --plan                       What ship would do: the release's changes in order, left out, clashes, files
+    cadence [--json] | --built TARGET --human   Is a release (or a phone build) due by the owner's cadence?
+
+CI cost:
+    ci-usage [--days 7]                     Where the Actions minutes went (by workflow, job, trigger, day)
+    metrics  [--days 30] [--save]           How the work flows: time to Done, time in each queue, reruns, defects, reverts
+    ci-settings --runner X --review Y       Run CI on your own runner; run the AI reviews locally
+    review ISSUE                            Local AI reviews in fresh sessions, posted as the PR's statuses
+
+Parallel chats (one worktree per agent chat):
+    worktree status|new|prep|list|clean [--apply] [--also <old folder>]
+    exclusive "WHO" -- COMMAND              Run a heavy test run when no other is running here (heavy_runs)
+    capacity [--list]                       Room for new builds? ready PRs and the UAT queue vs the limits
+    overlap --files a,b/                    Branches waiting for your test that change the same files
+
+Everyone:
+    version   [--check]                           Kit version here, in the project, and the latest release
+    doctor    [--role admin|developer] [--json]   Check what's done and what's missing
+    dev       [--apply] [--run-checks]            Developer onboarding on this machine
+    hooks     [--apply]                           Commit secret scan on, without switching off your own git hooks
+
+Safety rules built into the tool:
+  * Without --apply nothing is changed: you see the plan first.
+  * Secrets are never stored in the repo, printed, or passed through an agent's chat.
+    Steps that need one are marked [YOU, in your terminal] for the human to run.
+  * Nothing is deleted. Conflicting files are left alone and reported. The one exception,
+    `worktree clean --apply`, only removes finished worktrees with nothing unsaved in them.
+
+Requires: Python 3.8+, git. For github/invite: GitHub CLI (`gh`) logged in as a repo admin.
+
+Part of the HAAM kit: https://github.com/jorgedpl/haam-kit
+MIT licence. Copyright (c) 2026 Jorge del Prado. See docs/setup/HAAM-LICENSE.md.
+"""
+
+import argparse
+import contextlib
+import datetime
+import getpass
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import tempfile
+import time
+import signal
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+VERSION = "1.20.0"
+CONFIG_NAME = "haam.config.json"
+LOCK_NAME = "haam.lock.json"
+KIT_REPO = "jorgedpl/haam-kit"
+KIT_URL = f"https://github.com/{KIT_REPO}"
+PLACEHOLDER_KEY = "APP"
+LINEAR_API = "https://api.linear.app/graphql"
+# Test hook: only a local address is accepted, so a stray variable can't send keys elsewhere.
+if os.environ.get("HAAM_LINEAR_API", "").startswith("http://127.0.0.1:"):
+    LINEAR_API = os.environ["HAAM_LINEAR_API"]
+LINEAR_MCP = "https://mcp.linear.app/mcp"
+
+TRACKERS = ("github", "linear")
+
+NON_PRODUCTION_DEFAULT = ["prototypes/**", "docs/**", "**/*.md", "tests/**", "test/**", "**/__tests__/**",
+                          "**/*.test.*", "**/*.spec.*", "**/*_test.*", "**/test_*.py", "**/src/test/**",
+                          "**/src/androidTest/**", "**/*Tests/**"]
+
+DEFAULT_CONFIG = {
+    "product_name": "",
+    "tracker": "linear",
+    "github_project_owner": "",
+    "github_project_number": None,
+    "team_key": PLACEHOLDER_KEY,
+    "linear_team_name": "",
+    "github_repo": "",
+    "default_branch": "main",
+    "product_owner_github": "",
+    "backup_approvers_github": [],
+    "production_url": "",
+    "agents": ["claude", "cursor", "codex", "grok"],
+    "deploy": "github",          # github: deploy.yml runs on merge; manual: the owner deploys by hand
+    "max_open_prs": 10,          # agents hold new builds at this many ready PRs (drafts and docs-only PRs don't count)
+    "max_in_uat": 10,            # ...or at this many changes waiting for the owner to test (the main limit, test first)
+    # A temporary raise, e.g. for a weekend of agent work: {"until": "YYYY-MM-DD", "max_in_uat": 30}. After that day
+    # the normal limits apply again by themselves (config --max-in-uat 30 --until 2026-10-27 --human).
+    "review": "github",          # github | local | protected-only | off  (see SETTINGS below and `haam.py settings`)
+    "flow": "test-first",        # test-first: the owner tests locally before any PR exists; checks-first: PR + checks, then test
+    "grouping": "per-issue",     # per-issue | per-epic | release
+    "ci": "every-pr",            # every-pr | local | off
+    "nightly": "on",             # on | off: the full check and dependency audit on main every night
+    "uat": "owner-decides",      # owner-decides | always | bugs-skip | agents-verify
+    # uat: agents-verify. Areas that always keep the owner's own test, as {area name: [path patterns]}
+    # (settings --set owner_test_paths=<area>=<pattern>,<pattern> --human). Everything else may be verified by agents.
+    "owner_test_paths": {},
+    "agents_verify_shadow": 10,  # the first N verified tickets still go to the owner's test too (0: off)
+    "deploy_approval": "each",   # each: you approve every production deploy; automatic: deploys start on merge
+    "runner": "github",          # github | self-hosted
+    "worktree_cleanup": "after-ship",  # after-ship | manual
+    # Where agent worktrees live, relative to the main folder (or absolute). Default matches Claude Code.
+    # A sibling folder is fine, e.g. "../connect-wt".
+    "worktree_dir": ".claude/worktrees",
+    # Days with no sign of life (no comment on the issue, no commit on its branch) after which an agent may release
+    # another chat's claim (issue release --stale) and pick the work up. 0: never; `issue stale` only lists them.
+    "stale_claim_days": 0,
+    "release_after_passed": 0,
+    "release_after_days": 0,
+    "release_targets": {},
+    # Board fields every new issue must get on create (GitHub Projects). Empty: agents set a field only when
+    # the text clearly answers it. Example: ["Area", "Kind", "Code check"]. Epics use required_epic_fields
+    # when set, otherwise the same list without "Code check".
+    "required_issue_fields": [],
+    "required_epic_fields": None,  # None → derived from required_issue_fields (drop "Code check")
+    "max_review_rounds": 2,      # failing AI review rounds before an agent hands over to the human
+    "max_pr_lines": 400,         # target size of one PR (changed lines)
+    # Protected areas (AGENTS.md §4) as path patterns: the gate never lets these through the no-UAT lane and labels the
+    # PR human-review. ** = any folders, * = within one folder. Add the project's own (auth, payments, migrations…).
+    "protected_paths": ["AGENTS.md", "CLAUDE.md", ".agents/**", ".claude/**", ".cursor/**", ".codex/**", ".grok/**",
+                        ".gemini/**", ".github/**", "tools/haam/**", "haam.config.json", ".mcp.json", "Makefile",
+                        "scripts/**", ".githooks/**", ".gitleaks.toml", ".gitleaksignore"],
+    # Test runs that use something the whole machine shares (a local database the tests clone, a simulator, a device),
+    # as regular expressions matched against the process list. `haam.py exclusive` waits until none of them is running
+    # (and takes the machine-wide lock), so two chats' runs never collide. Empty: nothing waits.
+    "heavy_runs": [],
+    # Production code: what runs for real users. A change there always meets every gate, whatever mode it was built
+    # in; prototypes, tests and docs are outside it. production_paths minus non_production_paths. Spike branches
+    # (spike/…) never merge.
+    "production_paths": ["**"],
+    "non_production_paths": NON_PRODUCTION_DEFAULT,
+    "_applied": {"team_key": PLACEHOLDER_KEY, "product_name": ""},
+}
+
+REQUIRED_CHECKS = ["ci", "secrets", "dependencies", "ai-review", "security-review", "release-gate"]
+
+
+def required_checks(cfg):
+    """The checks the branch rules require, given the project's settings."""
+    ci = cfg.get("ci") or "every-pr"
+    checks = list(REQUIRED_CHECKS)
+    if ci == "local":
+        checks[0] = "ci-local"          # posted by `haam.py local-ci` on the owner's computer
+    elif ci == "off":
+        checks.remove("ci")
+    return checks
+
+
+# The owner's choices: what each setting does, its options and the trade-off. `haam.py settings` shows them,
+# /haam-settings walks through them, `settings --set key=value` changes one, `settings --apply` syncs GitHub.
+SETTINGS = [
+    ("Testing", "flow", ["test-first", "checks-first"], "When you test a change.", {
+        "test-first": "You test the agent's branch before any PR exists; the PR and its checks come after your pass, "
+                      "once. Fewest Actions minutes. (Recommended)",
+        "checks-first": "PR and checks first, then your test. You only test code that already passed the checks, "
+                        "but every rework round runs the checks again."}),
+    ("Testing", "uat", ["owner-decides", "always", "bugs-skip", "agents-verify"], "Which changes you test yourself.", {
+        "owner-decides": "You test everything, except issues you mark uat:skip (config, dependency bumps, invisible "
+                         "refactors): those merge once the checks and reviews pass. (Recommended)",
+        "always": "You test every change. Most control, most of your time.",
+        "bugs-skip": "When you triage a bug, it's marked uat:skip unless you say test: it then merges once the checks "
+                     "and reviews pass, without your test. Features still come to you; protected areas always do. "
+                     "Fast for bug fixes; you rely on the tests and the reviews to catch a wrong fix.",
+        "agents-verify": "A change that needs no person to judge it (its plan says `Needs a person: no`) and touches "
+                         "none of your owner_test_paths is verified by an independent agent at the handed-over "
+                         "commit, with its own marks (never your pass). You are told, can pull any ticket back "
+                         "(`test <ID> myself`), and it ships only on your `ship`. The rest come to you as today. "
+                         "Needs owner_test_paths and the GitHub tracker."}),
+    ("Testing", "agents_verify_shadow", int, "uat: agents-verify starts in shadow: this many verified tickets "
+     "still come to your test too, so you can compare. 0: off.", {}),
+    ("Grouping", "grouping", ["per-issue", "per-epic", "release"], "How changes become pull requests.", {
+        "per-issue": "One PR per issue: easy to follow and to revert. The checks run once per issue. (Recommended "
+                     "to start)",
+        "per-epic": "Agents batch an epic's small items into one branch and one PR: fewer PRs and check runs, but "
+                    "a problem in one item holds back the rest.",
+        "release": "No PR per change. After your pass, ship --all combines everything you passed into one release "
+                   "PR: the checks and the AI reviews run once per release. Fewest Actions minutes; but a bigger "
+                   "diff to review, and a failing release check needs sorting out before anything ships."}),
+    ("Checks", "ci", ["every-pr", "local", "off"], "Where `make check` (lint, types, tests, build) runs for a PR.", {
+        "every-pr": "On GitHub for every PR (once, when it's ready). Tamper-proof. (Recommended)",
+        "local": "On your computer: `haam.py local-ci` runs it on a clean copy of the PR's commit and posts the "
+                 "result. No Actions minutes; but not tamper-proof (anything using your login could post a pass), "
+                 "and your machine must be able to build everything.",
+        "off": "No `ci` check on PRs: agents still run make check before handover, and you test. Secret scanning, "
+               "dependency audit, the AI reviews and release-gate stay required. Use a release-time full check "
+               "(your deploy script runs make check / the full CI workflow on the commit it ships) so Linux-only "
+               "failures are still caught. The no-UAT lane can still auto-merge when the remaining checks pass. "
+               "`github --apply` drops the required `ci` check when you switch to off."}),
+    ("Checks", "nightly", ["on", "off"], "A full check and dependency audit on main every night.", {
+        "on": "Catches what PRs skipped (e.g. only the changed packages were tested) and new vulnerabilities. "
+              "About one run a day. (Recommended)",
+        "off": "Saves those minutes; you find out about breakage and vulnerabilities later."}),
+    ("Checks", "review", ["github", "local", "protected-only", "off"], "Where the two AI reviews run.", {
+        "github": "In GitHub Actions, by a Claude that never saw the code being written. Tamper-proof. "
+                  "(Recommended)",
+        "local": "On your computer (`haam.py review`), using your Claude plan instead of Actions minutes. Not "
+                 "tamper-proof; protected areas are still reviewed on GitHub.",
+        "protected-only": "Only PRs that touch protected areas get the AI reviews (on GitHub); the rest rely on "
+                          "the checks and your test. Saves most review minutes and tokens.",
+        "off": "No AI reviews: you review the code yourself, or nobody does."}),
+    ("Checks", "runner", ["github", "self-hosted"], "Whose machines run the jobs.", {
+        "github": "GitHub's runners: nothing to maintain. (Recommended)",
+        "self-hosted": "Your own machine (private repositories only): no Actions minutes, but it must be on and "
+                       "kept up to date."}),
+    ("Shipping", "deploy", ["github", "manual"], "How production is deployed.", {
+        "github": "deploy.yml deploys when a PR merges. (Recommended)",
+        "manual": "You deploy by hand (or another platform does); ship merges and then waits for you to say live."}),
+    ("Shipping", "deploy_approval", ["each", "automatic"], "Whether a deploy waits for your approval.", {
+        "each": "Every deploy waits for you (ship approves it when you say ship; one approval covers everything "
+                "merged before it). (Recommended)",
+        "automatic": "Deploys start as soon as a PR merges: fastest, but a merged change goes live without a last "
+                     "look. Best with uat: always."}),
+    ("Shipping", "release_after_passed", int, "grouping release: /cadence prepares a release once this many changes "
+     "have passed. 0 (default): only when you ask. You still say ship, the deploy and live.", {}),
+    ("Shipping", "release_after_days", int, "...or once the oldest passed change has waited this many days, so a quiet "
+     "week still ships. 0 (default): off. An Urgent issue, or one labelled security, is due at once.", {}),
+    ("Limits", "max_open_prs", int, "Agents hold new builds at this many ready PRs (CI cost).", {}),
+    ("Limits", "max_in_uat", int, "...or at this many changes waiting for your test.", {}),
+    ("Limits", "max_review_rounds", int, "Failing AI review rounds before an agent stops and hands over to you.", {}),
+    ("Limits", "max_pr_lines", int, "Target size of one PR, in changed lines (bigger PRs are split).", {}),
+    ("Housekeeping", "worktree_cleanup", ["after-ship", "manual"], "Tidying agents' worktrees (about 1-2 GB each).", {
+        "after-ship": "After each ship, worktrees whose work is merged or abandoned (and that have nothing "
+                      "unsaved) are removed. (Recommended)",
+        "manual": "You run haam.py worktree clean yourself."}),
+    ("Housekeeping", "worktree_dir", str, "Folder for agents' worktrees, relative to the main checkout "
+     "(or absolute). Default `.claude/worktrees`. A sibling like `../connect-wt` keeps them outside the repo.", {}),
+    ("Housekeeping", "stale_claim_days", int, "Days with no comment on a claimed issue and no commit on its branch "
+     "before an agent may release that claim and pick the work up (a chat that died: session limit, laptop asleep, "
+     "crash). 0 (default): never; /next lists them for you and /triage stale frees them.", {}),
+]
+INT_SETTINGS_ZERO_OK = {"stale_claim_days", "release_after_passed", "release_after_days", "agents_verify_shadow"}     # 0 means off
+SETTING_KEYS = {k: (g, opts, what, helps) for g, k, opts, what, helps in SETTINGS}
+
+GITHUB_LABELS = [
+    ("uat-passed", "0E8A16", "Gate G4 passed: human UAT OK"),
+    ("gate-override", "B60205", "Human override of G4; needs OVERRIDE: comment"),
+    ("human-review", "FBCA04", "Touches protected area; human code review required"),
+    ("ai-review-overruled", "5319E7", "Human overrules the AI reviews on this PR"),
+    ("uat:skip", "C2E0C6", "Owner decided: no UAT; merges once the checks and reviews pass"),
+    ("epic-build", "3E4B9E", "One PR for a whole epic, built slice by slice: review it per slice"),
+    # uat: agents-verify (issue labels; `github --apply` creates them)
+    ("verifying", "BFD4F2", "Handed over: waiting for an independent agent to verify it (uat: agents-verify)"),
+    ("verified-by-agents", "0E8A16", "Verified by an independent agent at its head; not the owner's pass"),
+    ("verify-failed", "D93F0B", "The verifier sent it back: rework first, then verify again"),
+    ("owner-test", "FBCA04", "The owner tests this one themselves; only the owner removes it"),
+    ("spot-check", "C5DEF5", "A verified ticket picked for a second verification on another model"),
+]
+
+# (name, Linear state type, colour)
+LINEAR_STATES = [
+    ("Triage", "triage", "#FC7840"),
+    ("Discovery", "backlog", "#BEC2C8"),
+    ("Decision", "backlog", "#F2C94C"),
+    ("Backlog", "backlog", "#95A2B3"),
+    ("Ready", "unstarted", "#E2E2E2"),
+    ("In Progress", "started", "#F2C94C"),
+    ("In Review", "started", "#5E6AD2"),
+    ("UAT", "started", "#26B5CE"),
+    ("Deploying", "started", "#4CB782"),
+    ("Done", "completed", "#5E6AD2"),
+    ("Parked", "canceled", "#95A2B3"),
+    ("Canceled", "canceled", "#95A2B3"),
+]
+
+LINEAR_LABELS = [
+    ("stream:idea", "#BB87FC", "New idea, not yet decided"),
+    ("stream:feature", "#4EA7FC", "Approved work"),
+    ("stream:bug", "#EB5757", "Something is broken"),
+    ("agent-ready", "#4CB782", "Passed G2: agents may build it"),
+    ("human-review", "#F2C94C", "Touches a protected area: human code review required"),
+    ("human-only", "#95A2B3", "Agents must not pick this up"),
+    ("override-followup", "#FC7840", "Created after a gate override"),
+    ("epic", "#3E4B9E", "Groups the issues that make up one feature (its sub-issues)"),
+    ("uat-failed", "#D93F0B", "Failed the human test: rework first, then test again"),
+    ("uat:skip", "#C2E0C6", "Owner decided: no UAT; merges once the checks and reviews pass"),
+    ("claimed", "#FBCA04", "An agent chat is assessing it, writing its spec or building a prototype"),
+    ("mode:prototype", "#D4C5F9", "Owner decided: an agent builds a throwaway prototype first (/spike)"),
+    ("mode:epic-build", "#3E4B9E", "Owner decided: one lead agent builds this whole epic, slice by slice"),
+    ("spike-ready", "#D4C5F9", "A prototype is ready for the owner to try (/test)"),
+]
+
+# Files the rename step rewrites (team key / product name)
+RENAME_ROOTS = ["AGENTS.md", "CLAUDE.md", ".agents", ".github", "docs"]
+TEXT_SUFFIXES = {".md", ".yml", ".yaml", ".json", ".sh", ".txt", ".toml", ""}
+
+SKILL_LINKS = [".claude/skills", ".grok/skills"]
+GITIGNORE_MARK = "# --- HAAM ---"
+GITIGNORE_END = "# --- /HAAM ---"
+
+# ----------------------------------------------------------------------------- output
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(code, text):
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+OK, WARN, BAD, INFO = c("32", "✔"), c("33", "!"), c("31", "✘"), c("36", "•")
+WHO_AGENT = "[agent]"
+WHO_TERMINAL = "[YOU, in your terminal]"
+WHO_BROWSER = "[YOU, in the browser]"
+
+
+class Report:
+    """Collects results so the same data can be printed for humans or as JSON for agents."""
+
+    def __init__(self):
+        self.sections = []
+        self.actions = []
+
+    def section(self, title):
+        self.sections.append({"title": title, "items": []})
+
+    def add(self, status, text, detail=""):
+        if not self.sections:
+            self.section("General")
+        self.sections[-1]["items"].append({"status": status, "text": text, "detail": detail})
+
+    def action(self, who, text, command=""):
+        self.actions.append({"who": who, "text": text, "command": command})
+
+    def counts(self):
+        out = {"ok": 0, "warn": 0, "fail": 0, "info": 0}
+        for s in self.sections:
+            for i in s["items"]:
+                out[i["status"]] = out.get(i["status"], 0) + 1
+        return out
+
+    def print(self, as_json=False):
+        if as_json:
+            print(json.dumps({"version": VERSION, "sections": self.sections,
+                              "next_actions": self.actions, "counts": self.counts()}, indent=2))
+            return
+        sym = {"ok": OK, "warn": WARN, "fail": BAD, "info": INFO}
+        for s in self.sections:
+            print(f"\n{c('1', s['title'])}")
+            for i in s["items"]:
+                line = f"  {sym.get(i['status'], INFO)} {i['text']}"
+                if i["detail"]:
+                    line += c("2", f"  ({i['detail']})")
+                print(line)
+        if self.actions:
+            print(f"\n{c('1', 'Next actions')}")
+            for n, a in enumerate(self.actions, 1):
+                print(f"  {n}. {c('1', a['who'])} {a['text']}")
+                if a["command"]:
+                    print(f"       {c('36', a['command'])}")
+        cnt = self.counts()
+        summary = f"{cnt['ok']} ok · {cnt['warn']} to check · {cnt['fail']} missing"
+        print("\n" + c("2", summary))
+
+
+# ----------------------------------------------------------------------------- helpers
+
+def run(cmd, cwd=None, input_text=None, check=False):
+    """Run a command, return (code, stdout, stderr). Never raises for missing binaries."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, input=input_text, capture_output=True, text=True)
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]}: not installed"
+    if check and p.returncode != 0:
+        raise RuntimeError(p.stderr.strip() or p.stdout.strip())
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def have(binary):
+    return shutil.which(binary) is not None
+
+
+def kit_root():
+    return Path(__file__).resolve().parents[2]
+
+
+def find_repo_root(start):
+    code, out, _ = run(["git", "rev-parse", "--show-toplevel"], cwd=start)
+    return Path(out) if code == 0 else Path(start).resolve()
+
+
+def load_config(root):
+    p = root / CONFIG_NAME
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if p.exists():
+        try:
+            data = json.loads(p.read_text())
+            cfg.update(data)
+            cfg.setdefault("_applied", {"team_key": PLACEHOLDER_KEY, "product_name": ""})
+        except json.JSONDecodeError as e:
+            sys.exit(f"{CONFIG_NAME} is not valid JSON: {e}")
+    return cfg
+
+
+def save_config(root, cfg):
+    (root / CONFIG_NAME).write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def detect_github_repo(root):
+    code, url, _ = run(["git", "remote", "get-url", "origin"], cwd=root)
+    if code != 0:
+        return ""
+    m = re.search(r"github\.com[:/]+([^/]+/[^/.]+?)(?:\.git)?$", url)
+    return m.group(1) if m else ""
+
+
+def iter_text_files(root, rel_roots):
+    for rel in rel_roots:
+        base = root / rel
+        if base.is_file():
+            yield base
+        elif base.is_dir():
+            for p in base.rglob("*"):
+                if p.is_file() and not p.is_symlink() and p.suffix in TEXT_SUFFIXES:
+                    yield p
+
+
+def todo_count(root):
+    hits = []
+    for p in iter_text_files(root, ["AGENTS.md", "Makefile", "docs", ".github"]):
+        try:
+            for n, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
+                if "TODO(setup)" in line:
+                    hits.append(f"{p.relative_to(root)}:{n}")
+        except OSError:
+            pass
+    return hits
+
+
+def is_tty():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def ask(prompt, default=""):
+    if not is_tty():
+        return default
+    suffix = f" [{default}]" if default else ""
+    val = input(f"{prompt}{suffix}: ").strip()
+    return val or default
+
+
+# ----------------------------------------------------------------------------- install
+
+def merge_json(dst, src_bytes, merger):
+    try:
+        a = json.loads(dst.read_text())
+        b = json.loads(src_bytes)
+    except (json.JSONDecodeError, OSError):
+        return False
+    before = json.dumps(a, sort_keys=True)
+    merged = merger(a, b)
+    if json.dumps(merged, sort_keys=True) == before:
+        return "same"
+    dst.write_text(json.dumps(merged, indent=2) + "\n")
+    return True
+
+
+def merge_mcp(a, b):
+    a.setdefault("mcpServers", {})
+    for k, v in b.get("mcpServers", {}).items():
+        a["mcpServers"].setdefault(k, v)
+    return a
+
+
+def merge_gemini(a, b):
+    ctx = a.setdefault("context", {})
+    names = ctx.get("fileName", [])
+    if isinstance(names, str):
+        names = [names]
+    for n in b.get("context", {}).get("fileName", []):
+        if n not in names:
+            names.append(n)
+    ctx["fileName"] = names
+    return a
+
+
+def merge_claude_settings(a, b):
+    perms_a = a.setdefault("permissions", {})
+    for key, vals in b.get("permissions", {}).items():
+        cur = perms_a.setdefault(key, [])
+        for v in vals:
+            if v not in cur:
+                cur.append(v)
+    for key in ("enabledMcpjsonServers",):
+        cur = a.setdefault(key, [])
+        for v in b.get(key, []):
+            if v not in cur:
+                cur.append(v)
+    a.setdefault("enableAllProjectMcpServers", b.get("enableAllProjectMcpServers", False))
+    hooks_a = a.setdefault("hooks", {})
+    for event, entries in b.get("hooks", {}).items():
+        cur = hooks_a.setdefault(event, [])
+        existing_cmds = {h.get("command", "") for entry in cur for h in entry.get("hooks", [])}
+        for e in entries:
+            cmds = [h.get("command", "") for h in e.get("hooks", [])]
+            if not all(cmd in existing_cmds for cmd in cmds):
+                cur.append(e)
+    return a
+
+
+LINEAR_FILES = (".mcp.json", ".cursor/mcp.json", ".claude/settings.json")
+
+
+def without_linear(data, keep_enabled=False):
+    """A kit JSON file minus its Linear connection (for projects that track work on GitHub). A server called
+    "linear" that isn't Linear's own (a project's proxy, say) is left alone, and so is its switch when keep_enabled."""
+    servers = data.get("mcpServers")
+    if isinstance(servers, dict) and LINEAR_MCP in json.dumps(servers.get("linear", {})):
+        servers.pop("linear")
+    if isinstance(data.get("enabledMcpjsonServers"), list) and not keep_enabled:
+        data["enabledMcpjsonServers"] = [x for x in data["enabledMcpjsonServers"] if x != "linear"]
+    return data
+
+
+def remove_linear_connection(root, apply=True):
+    """GitHub-tracker projects don't use Linear: take the kit's Linear connection out of the MCP and Claude settings
+    (a file that held nothing else is removed, and forgotten in the lock so switching to Linear later restores it).
+    Returns the files changed. Other servers are left alone."""
+    changed, own_linear = [], False
+    for rel in LINEAR_FILES:          # the MCP files first: they decide whether a project's own "linear" stays on
+        f = root / rel
+        if not f.exists():
+            continue
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        before = json.dumps(data, sort_keys=True)
+        data = without_linear(data, keep_enabled=own_linear)
+        if rel == ".mcp.json" and "linear" in (data.get("mcpServers") or {}):
+            own_linear = True
+        if json.dumps(data, sort_keys=True) == before:
+            continue
+        changed.append(rel)
+        if apply:
+            if rel != ".claude/settings.json" and data == {"mcpServers": {}}:
+                f.unlink()
+                if (root / LOCK_NAME).exists():
+                    lock = load_lock(root)
+                    if lock.get("files", {}).pop(rel, None) is not None:
+                        save_lock(root, lock)
+            else:
+                f.write_text(json.dumps(data, indent=2) + "\n")
+    return changed
+
+
+JSON_MERGERS = {
+    ".mcp.json": merge_mcp,
+    ".cursor/mcp.json": merge_mcp,
+    ".gemini/settings.json": merge_gemini,
+    ".claude/settings.json": merge_claude_settings,
+}
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+# Project-owned blocks in kit files (skills, docs). Survives `haam.py update` when both sides change.
+# <!-- HAAM:project-patch --> … <!-- /HAAM:project-patch -->
+# Optional name: <!-- HAAM:project-patch:deploy --> … <!-- /HAAM:project-patch:deploy -->
+_PATCH_BLOCK = re.compile(
+    br"<!--\s*HAAM:project-patch(?::([A-Za-z0-9_.-]+))?\s*-->\s*(.*?)\s*<!--\s*/HAAM:project-patch(?:(?::\1)?)\s*-->",
+    re.S,
+)
+_PATCH_SLOT = re.compile(
+    br"(<!--\s*HAAM:project-patch(?::([A-Za-z0-9_.-]+))?\s*-->)\s*(.*?)\s*(<!--\s*/HAAM:project-patch(?:(?::\2)?)\s*-->)",
+    re.S,
+)
+
+
+def extract_project_patches(data: bytes):
+    """[(name_or_None, inner_bytes), …] from a project file."""
+    return [(m.group(1), m.group(2).strip(b"\n")) for m in _PATCH_BLOCK.finditer(data)]
+
+
+def apply_project_patches(kit: bytes, patches):
+    """Put the project's patch bodies into the kit file. Named slots in the kit are filled; unnamed /
+    leftover patches are appended under a 'Project additions' heading."""
+    if not patches:
+        return kit
+    used = set()
+
+    def fill(m):
+        name = m.group(2)
+        for i, (n, body) in enumerate(patches):
+            if i in used:
+                continue
+            if (name is None and n is None) or (name is not None and n == name):
+                used.add(i)
+                return m.group(1) + b"\n" + body + b"\n" + m.group(3)
+        return m.group(0)
+
+    out = _PATCH_SLOT.sub(fill, kit)
+    leftover = [(n, b) for i, (n, b) in enumerate(patches) if i not in used]
+    if leftover:
+        block = [b"\n\n## Project additions (kept across HAAM updates)\n"]
+        for n, body in leftover:
+            open_ = b"<!-- HAAM:project-patch" + (b":" + n if n else b"") + b" -->\n"
+            close = b"\n<!-- /HAAM:project-patch" + (b":" + n if n else b"") + b" -->\n"
+            block += [open_, body, close]
+        out = out.rstrip() + b"".join(block)
+    return out
+
+
+def required_fields_for(cfg, epic=False):
+    """Field names that issue create must set (GitHub Projects board fields)."""
+    if epic:
+        epic_req = cfg.get("required_epic_fields")
+        if epic_req is not None:
+            return list(epic_req)
+        base = list(cfg.get("required_issue_fields") or [])
+        return [f for f in base if f.lower() != "code check"]
+    return list(cfg.get("required_issue_fields") or [])
+
+
+def load_lock(root):
+    p = root / LOCK_NAME
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {"kit_version": None, "kit_repo": KIT_REPO, "files": {}}
+
+
+def save_lock(root, lock):
+    lock["files"] = dict(sorted(lock["files"].items()))
+    (root / LOCK_NAME).write_text(json.dumps(lock, indent=2) + "\n")
+
+
+def project_language(target, override=None):
+    """The language of the project's docs: --language, then haam.config.json, then the lock, then English."""
+    tcfg = load_config(target) if (target / CONFIG_NAME).exists() else {}
+    lang = override or tcfg.get("language") or load_lock(target).get("language") or "en"
+    if lang not in LANGUAGES:
+        sys.exit(f"Unknown language '{lang}'. Choose one of: {', '.join(LANGUAGES)}")
+    return lang
+
+
+GATES_WORKFLOW = ".github/workflows/gates.yml"
+CHANGEOVER_NOTE = ("gates.yml: step 1 of 2 (it also listens to pull_request, so the PR that brings it gets a gate)",
+                   "once this is on main, run haam.py update again: it removes that trigger, so a PR can't run its "
+                   "own copy of the gate")
+CHANGEOVER_RE = re.compile(r"^[ \t]*(?:#|//) >>> haam:changeover.*\n.*?^[ \t]*(?:#|//) <<< haam:changeover.*\n",
+                           re.M | re.S)
+LISTENS_TARGET_RE = re.compile(r"^ {2}pull_request_target:\s*$", re.M)
+
+
+def main_gates_listens_target(target):
+    """Whether the gate GitHub runs for this project's PRs (main's gates.yml) already listens to pull_request_target.
+    Read from origin's default branch (never this folder: running update twice on one branch must not skip a step).
+    False when main has no gates.yml or can't be read here: keeping the changeover lines is the safe side."""
+    for ref in ("origin/HEAD", "origin/main", "origin/master"):
+        p = subprocess.run(["git", "-C", str(target), "show", f"{ref}:{GATES_WORKFLOW}"], capture_output=True,
+                           text=True)
+        if p.returncode == 0:
+            return bool(LISTENS_TARGET_RE.search(p.stdout))
+        if "exists on disk, but not in" in (p.stderr or "") or "does not exist in" in (p.stderr or ""):
+            return False      # the branch is there, without a gates.yml: the first install
+    return False
+
+
+def gates_changeover(data, target):
+    """gates.yml for this project, and whether it is the changeover's first step. The gate runs on
+    `pull_request_target` (GitHub runs main's copy, so a PR can't rewrite the gate that judges it), but the PR that
+    first brings that copy is judged before main has it, and main's old copy knows no `pull_request_target`: that PR
+    would get no gate at all. So while main's copy doesn't listen to it, the lines between the `haam:changeover`
+    markers stay (a `pull_request` trigger whose run posts only in that case), and the next update removes them."""
+    if main_gates_listens_target(target):
+        return CHANGEOVER_RE.sub("", data.decode()).encode(), False
+    return data, CHANGEOVER_RE.search(data.decode()) is not None
+
+
+def make_renderer(target, language=None):
+    """Return render(path, rel) -> bytes: kit file content as it should look in this project. `render.changeover`
+    is True once gates.yml was rendered as the changeover's first step (see gates_changeover)."""
+    tcfg = load_config(target) if (target / CONFIG_NAME).exists() else None
+    lang = project_language(target, language)
+    i18n = kit_root() / I18N_DIR / lang
+    applied_key = (tcfg or {}).get("_applied", {}).get("team_key", PLACEHOLDER_KEY)
+    applied_product = (tcfg or {}).get("_applied", {}).get("product_name", "")
+    github_tracker = (tcfg or {}).get("tracker") == "github"
+    # The project removed the .mcp.json the kit installed: don't switch on servers it no longer declares.
+    mcp_removed = ".mcp.json" in (load_lock(target).get("files") or {}) and not (target / ".mcp.json").exists()
+
+    def render(path, rel_s):
+        if lang != "en" and (i18n / rel_s).is_file():
+            path = i18n / rel_s            # this project's language
+        data = path.read_bytes()
+        if rel_s == GATES_WORKFLOW:
+            data, first_step = gates_changeover(data, target)
+            render.changeover = render.changeover or first_step
+        if github_tracker and rel_s in LINEAR_FILES:
+            kit = without_linear(json.loads(data))
+            if kit == {"mcpServers": {}}:
+                return None          # nothing left for this project: don't install the file
+            return (json.dumps(kit, indent=2) + "\n").encode()
+        if mcp_removed and rel_s == ".claude/settings.json":
+            kit = json.loads(data)
+            kit["enabledMcpjsonServers"] = []
+            return (json.dumps(kit, indent=2) + "\n").encode()
+        in_scope = any(rel_s == r or rel_s.startswith(r + "/") for r in RENAME_ROOTS)
+        if not in_scope or path.suffix not in TEXT_SUFFIXES or (applied_key == PLACEHOLDER_KEY and not applied_product):
+            return data
+        try:
+            text = data.decode()
+        except UnicodeDecodeError:
+            return data
+        if applied_key != PLACEHOLDER_KEY:
+            text = re.sub(rf"\b{PLACEHOLDER_KEY}\b", applied_key, text)
+            text = re.sub(rf"\b{PLACEHOLDER_KEY.lower()}-(\d)", lambda m: f"{applied_key.lower()}-{m.group(1)}", text)
+            text = text.replace(" (`TODO(setup)`: replace with your team key everywhere)", "")
+        if applied_product:
+            text = text.replace("`TODO(setup): product name`", applied_product)
+        return text.encode()
+    render.changeover = False
+    return render
+
+
+def kit_files(src):
+    """Files the kit installs, as (path, posix relative path)."""
+    for p in sorted(src.rglob("*")):
+        rel = p.relative_to(src)
+        rel_s = rel.as_posix()
+        if rel.parts[0] in (".git", ".haam", I18N_DIR) or rel_s in INSTALL_SKIP or "__pycache__" in rel.parts:
+            continue
+        if p.is_symlink() or p.is_dir():
+            continue  # links are created by `agents`; dirs are created as needed
+        if any(rel_s.startswith(l + "/") or rel_s == l for l in SKILL_LINKS):
+            continue
+        yield p, rel_s
+
+
+def sync_gitignore(src, target, dry_run):
+    """Add or refresh the HAAM block in .gitignore, plus re-include lines for kit files the project's own
+    rules would hide. Those go in a separate block kept at the very end of the file: in .gitignore the
+    last matching rule wins, so they must come after every project rule. Returns True if it changed."""
+    add_path = src / ".gitignore.additions"
+    if not add_path.exists():
+        return False
+    gi = target / ".gitignore"
+    current = gi.read_text() if gi.exists() else ""
+
+    def cut(text, start_mark, end_mark):
+        """(text without the marked block, the block's non-empty lines)."""
+        if start_mark not in text:
+            return text, []
+        i = text.index(start_mark)
+        j = text.find(end_mark, i)
+        inner, after = (text[i + len(start_mark):], "") if j == -1 else (text[i + len(start_mark):j], text[j + len(end_mark):])
+        return text[:i] + after.lstrip("\n"), [l.strip() for l in inner.splitlines() if l.strip()]
+
+    body, old_unhide = cut(current, UNHIDE_MARK, UNHIDE_END)
+    keep_neg = [l for l in old_unhide if l.startswith("!/")]
+    block = f"{GITIGNORE_MARK}\n{add_path.read_text().rstrip()}\n{GITIGNORE_END}\n"
+    if GITIGNORE_MARK in body:
+        start = body.index(GITIGNORE_MARK)
+        end = body.find(GITIGNORE_END, start)
+        end = len(body) if end == -1 else end + len(GITIGNORE_END)
+        new = body[:start] + block.rstrip("\n") + body[end:]
+    else:
+        new = body + ("\n" if body and not body.endswith("\n") else "") + ("\n" if body.strip() else "") + block
+    new = new.rstrip("\n") + "\n"
+    # Which kit files would the project's rules hide? Check against the file without our re-include lines.
+    neg = list(keep_neg)
+    if not dry_run or gi.exists():
+        saved = current
+        gi.write_text(new)
+        try:
+            for line in unignore_lines(target, [r for _, r in kit_files(src)]):
+                if line not in neg:
+                    neg.append(line)
+        finally:
+            if dry_run:
+                gi.write_text(saved)
+    if neg:
+        new += "\n" + UNHIDE_MARK + "\n" + "\n".join(neg) + "\n" + UNHIDE_END + "\n"
+    if new == current:
+        return False
+    if not dry_run:
+        gi.write_text(new)
+    return True
+
+def make_executable(target, src=None):
+    """Make the kit's own executable files executable in the project. Never touches the project's files."""
+    src = src or kit_root()
+    for p, rel_s in kit_files(src):
+        dst = target / rel_s
+        if p.stat().st_mode & 0o111 and dst.exists() and dst.is_file():
+            dst.chmod(dst.stat().st_mode | 0o111)
+
+
+def ignored_paths(target, rels):
+    """Which of these paths the project's .gitignore hides (so they would never be committed)."""
+    if not rels or run(["git", "rev-parse", "--git-dir"], cwd=target)[0] != 0:
+        return set()
+    code, out, _ = run(["git", "check-ignore", "--stdin"], cwd=target, input_text="\n".join(rels) + "\n")
+    return {l.strip() for l in out.splitlines() if l.strip()} if code in (0, 1) else set()
+
+
+def unignore_lines(target, rels):
+    """.gitignore negations that re-include kit files hidden by the project's own rules (e.g. '**/build/'
+    hides .agents/skills/build/). A negation must name the highest ignored folder, so walk up each path."""
+    hidden = ignored_paths(target, rels)
+    lines = []
+    for rel in sorted(hidden):
+        parts = rel.split("/")
+        top = rel
+        for k in range(1, len(parts)):
+            d = "/".join(parts[:k]) + "/"
+            if ignored_paths(target, [d]):
+                top = d
+                break
+        line = f"!/{top}"
+        if line not in lines:
+            lines.append(line)
+    return lines
+
+
+INSTALL_SKIP = {".gitignore.additions", "START-HERE.md"}
+# Translations of the human-facing docs: i18n/<language>/<the same path>. A project gets the English file, or its
+# language's version where one exists. Agent instructions (AGENTS.md, skills, reviewer prompts) stay in English.
+I18N_DIR = "i18n"
+LANGUAGES = {"en": "English", "es": "Español", "fr": "Français", "de": "Deutsch", "it": "Italiano",
+             "nl": "Nederlands", "pt": "Português"}
+UNHIDE_MARK = "# >>> HAAM: kit files your own rules would hide (kept last so they win; every machine needs them)"
+UNHIDE_END = "# <<< HAAM re-include"
+
+
+def cmd_install(args):
+    src = kit_root()
+    target = Path(args.target).resolve()
+    if not (src / "AGENTS.md").exists():
+        sys.exit(f"Can't find the HAAM kit next to this tool (looked in {src}).")
+    if not (target / ".git").exists():
+        sys.exit(f"{target} is not a git repository. Run this against your project's root folder.")
+    if src == target:
+        sys.exit("Source and target are the same folder.")
+    if (target / LOCK_NAME).exists():
+        lv = load_lock(target).get("kit_version")
+        print(f"HAAM {lv} is already installed here. Use `update` to move to {VERSION}; continuing as a re-install check.\n")
+
+    rep = Report()
+    rep.section(f"Installing HAAM {VERSION} into {target}")
+    lang = project_language(target, args.language)
+    render = make_renderer(target, lang)
+    lock = load_lock(target)
+    incoming = target / ".haam" / "incoming"
+    created, same, merged, conflicts = [], [], [], []
+
+    for p, rel_s in kit_files(src):
+        dst = target / rel_s
+        content = render(p, rel_s)
+        if content is None:
+            continue
+        lock["files"][rel_s] = sha(content)
+        if not dst.exists():
+            if not args.dry_run:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(content)
+                shutil.copymode(p, dst)
+            created.append(rel_s)
+            continue
+        if dst.read_bytes() == content:
+            same.append(rel_s)
+            continue
+        if rel_s in JSON_MERGERS:
+            result = "dry" if args.dry_run else merge_json(dst, content, JSON_MERGERS[rel_s])
+            if result == "same":
+                same.append(rel_s)
+                continue
+            if result:
+                merged.append(rel_s)
+                continue
+        conflicts.append(rel_s)
+        if not args.dry_run:
+            out = incoming / rel_s
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(content)
+
+    if sync_gitignore(src, target, args.dry_run):
+        merged.append(".gitignore")
+    if not args.dry_run:
+        make_executable(target)
+        lock["kit_version"] = VERSION
+        lock["kit_repo"] = KIT_REPO
+        lock["language"] = lang
+        save_lock(target, lock)
+
+    rep.add("ok", f"{len(created)} files added")
+    if merged:
+        rep.add("ok", f"{len(merged)} existing files merged automatically", ", ".join(merged))
+    if same:
+        rep.add("info", f"{len(same)} files already up to date")
+    for cf in conflicts:
+        rep.add("warn", f"Kept your existing {cf}", f"kit version saved to .haam/incoming/{cf}")
+    rep.add("info", f"Kit version {VERSION} recorded in {LOCK_NAME} (commit it)")
+    if render.changeover:
+        rep.add("warn", *CHANGEOVER_NOTE)
+    if conflicts:
+        rep.action(WHO_AGENT, "Merge each conflicting file using the kit version in .haam/incoming/ "
+                   "(rules in docs/setup/HAAM-ADOPTION-GUIDE.md, Phase 1 table). For an existing CLAUDE.md or AGENTS.md: "
+                   "move project-specific content into docs/product/ARCHITECTURE.md (or a 'Project specifics' "
+                   "section at the end of AGENTS.md), then use the kit version. Delete .haam/incoming when done.")
+    rep.action(WHO_AGENT, "Wire up the agent tools (skills links, MCP configs)", "python3 tools/haam/haam.py agents --apply")
+    rep.action(WHO_AGENT, "Create the project config with the human's answers", "python3 tools/haam/haam.py config")
+    if args.dry_run:
+        rep.add("info", "Dry run: nothing was written")
+    rep.print(args.json)
+
+
+def version_tuple(v):
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", v or "")
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+
+def cmd_update(args):
+    src = kit_root()
+    target = Path(args.target).resolve()
+    if not (src / "AGENTS.md").exists():
+        sys.exit(f"Can't find the HAAM kit next to this tool (looked in {src}).")
+    if src == target:
+        sys.exit("Run the NEW kit's tool against your project: python3 <new-kit>/template/tools/haam/haam.py update --target .")
+    if not (target / "AGENTS.md").exists():
+        sys.exit("HAAM isn't installed in that folder. Use `install` first.")
+
+    lock = load_lock(target)
+    old = lock.get("kit_version") or "unknown"
+    rep = Report()
+    rep.section(f"Updating HAAM {old} → {VERSION} in {target}")
+    if old != "unknown" and version_tuple(old) > version_tuple(VERSION):
+        sys.exit(f"The project has HAAM {old}, newer than this kit ({VERSION}). Use a newer kit.")
+    if version_tuple(VERSION)[0] > version_tuple(old)[0] and old != "unknown":
+        rep.add("warn", f"Major version change ({old} → {VERSION})",
+                "read the migration notes in the kit's CHANGELOG before applying")
+
+    lang = project_language(target)
+    render = make_renderer(target, lang)
+    if lang != (lock.get("language") or "en"):
+        rep.add("info", f"Docs language: {LANGUAGES[lang]}", "the docs you haven't changed switch to it")
+    incoming = target / ".haam" / "incoming"
+    added, updated, kept, conflicts, merged, same, skipped, patched = [], [], [], [], [], [], [], []
+    hidden = ignored_paths(target, [r for _, r in kit_files(src)])
+    unhidden = []
+    seen = set()
+    new_lock = dict(lock.get("files", {}))
+
+    for p, rel_s in kit_files(src):
+        seen.add(rel_s)
+        dst = target / rel_s
+        new = render(p, rel_s)
+        base = lock.get("files", {}).get(rel_s)
+        if new is None:              # not used by this project (e.g. the Linear connection on a GitHub tracker)
+            new_lock.pop(rel_s, None)
+            continue
+        if rel_s in JSON_MERGERS and dst.exists():
+            result = "dry" if args.dry_run or not args.apply else merge_json(dst, new, JSON_MERGERS[rel_s])
+            (same if result == "same" else merged).append(rel_s)
+            new_lock[rel_s] = sha(new)
+            continue
+        if not dst.exists():
+            if base is not None and rel_s not in hidden:
+                skipped.append(rel_s)  # project deliberately removed it
+                continue
+            if rel_s in hidden:
+                unhidden.append(rel_s)
+            added.append(rel_s)
+            if args.apply:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(new)
+                shutil.copymode(p, dst)
+            new_lock[rel_s] = sha(new)
+            continue
+        cur = dst.read_bytes()
+        if cur == new:
+            same.append(rel_s)
+            new_lock[rel_s] = sha(new)
+        elif base is not None and sha(cur) == base:
+            updated.append(rel_s)  # untouched by the project: safe to replace
+            if args.apply:
+                dst.write_bytes(new)
+                shutil.copymode(p, dst)
+            new_lock[rel_s] = sha(new)
+        elif base is not None and sha(new) == base:
+            kept.append(rel_s)  # project customised it; kit didn't change it
+        else:
+            # Both changed. If the project marked HAAM:project-patch blocks, fold them into the kit
+            # version automatically (skills and docs agents customise without losing kit updates).
+            patches = extract_project_patches(cur)
+            if patches:
+                combined = apply_project_patches(new, patches)
+                patched.append(rel_s)
+                if args.apply:
+                    dst.write_bytes(combined)
+                    shutil.copymode(p, dst)
+                new_lock[rel_s] = sha(combined)
+            else:
+                conflicts.append(rel_s)  # both changed (or no record): needs a merge
+                if args.apply:
+                    out = incoming / rel_s
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_bytes(new)
+                new_lock[rel_s] = sha(new)
+
+    removed = sorted(r for r in lock.get("files", {}) if r not in seen)
+    for r in removed:
+        new_lock.pop(r, None)
+
+    gi_changed = sync_gitignore(src, target, dry_run=not args.apply)
+    tcfg = load_config(target) if (target / CONFIG_NAME).exists() else {}
+    unlinked = remove_linear_connection(target, apply=args.apply) if tcfg.get("tracker") == "github" else []
+
+    rep.add("ok" if added else "info", f"{len(added)} new files", ", ".join(added[:8]) + (" …" if len(added) > 8 else ""))
+    rep.add("ok" if updated else "info", f"{len(updated)} files updated (you hadn't changed them)",
+            ", ".join(updated[:8]) + (" …" if len(updated) > 8 else ""))
+    if merged:
+        rep.add("ok", f"{len(merged)} settings files merged", ", ".join(merged))
+    if gi_changed:
+        rep.add("ok", ".gitignore HAAM block refreshed")
+    if unlinked:
+        rep.add("ok", "Linear connection taken out (this project tracks work on GitHub)", ", ".join(unlinked))
+    rep.add("info", f"{len(same)} files already current")
+    if kept:
+        rep.add("info", f"{len(kept)} of your customised files kept (no kit change)", ", ".join(kept[:8]))
+    if patched:
+        rep.add("ok", f"{len(patched)} files updated with your HAAM:project-patch blocks kept",
+                ", ".join(patched[:8]) + (" …" if len(patched) > 8 else ""))
+    for r in skipped:
+        rep.add("info", f"Skipped {r}", "you removed it; not re-added")
+    if hidden:
+        rep.add("warn", f"{len(hidden)} kit file(s) were hidden by your .gitignore", ", ".join(sorted(hidden)[:6])
+                + (" …" if len(hidden) > 6 else "") + " · the HAAM block in .gitignore now re-includes them; commit them")
+    for r in unhidden:
+        rep.add("ok", f"Restored {r}", "it was missing because .gitignore hid it, not because you removed it")
+    for r in conflicts:
+        rep.add("warn", f"Needs a merge: {r}", f"you and the kit both changed it; new kit version → .haam/incoming/{r}")
+    if render.changeover and GATES_WORKFLOW in added + updated + conflicts + patched:
+        rep.add("warn", *CHANGEOVER_NOTE)
+    for r in removed:
+        rep.add("warn", f"No longer in the kit: {r}", "delete it if you don't use it (nothing is deleted automatically)")
+
+    if args.apply:
+        make_executable(target)
+        lock["files"] = new_lock
+        lock["kit_version"] = VERSION
+        lock["kit_repo"] = KIT_REPO
+        lock["language"] = lang
+        save_lock(target, lock)
+        rep.add("ok", f"{LOCK_NAME} now records {VERSION}")
+    else:
+        rep.add("info", "Plan only. Re-run with --apply (on a branch) to update")
+
+    if conflicts:
+        rep.action(WHO_AGENT, "Merge each file in .haam/incoming/ into the project's version, keeping the project's "
+                   "customisations and adopting the kit's changes. Show the human what changed. Delete .haam/incoming when done.")
+    rep.action(WHO_AGENT, f"Read the kit CHANGELOG entries after {old} for migration steps (e.g. new required checks or "
+               "Linear statuses), then re-run the plans", "python3 tools/haam/haam.py github  ·  python3 tools/haam/haam.py linear")
+    rep.action(WHO_AGENT, "Check everything", "python3 tools/haam/haam.py agents --apply && python3 tools/haam/haam.py doctor")
+    rep.print(args.json)
+
+
+def cmd_changeover(args):
+    """Finish the gate's changeover: once main's gates.yml listens to pull_request_target, remove the
+    `haam:changeover` lines from this folder's copy (what `update` does when a newer kit comes)."""
+    root = find_repo_root(Path.cwd())
+    f = root / GATES_WORKFLOW
+    text = f.read_text() if f.is_file() else ""
+    if not CHANGEOVER_RE.search(text):
+        print(f"Nothing to do: {GATES_WORKFLOW} has no changeover lines.")
+        return
+    if not main_gates_listens_target(root):
+        sys.exit(f"Not yet: main's {GATES_WORKFLOW} doesn't listen to pull_request_target. Merge the update that "
+                 "brings it first (git fetch, then run this again).")
+    done = CHANGEOVER_RE.sub("", text)
+    if not args.apply:
+        print(f"Plan: remove the pull_request trigger and its check from {GATES_WORKFLOW} "
+              f"({len(text.splitlines()) - len(done.splitlines())} lines). Re-run with --apply on a branch.")
+        return
+    lock = load_lock(root)
+    untouched = (lock.get("files") or {}).get(GATES_WORKFLOW) == sha(text.encode())
+    f.write_text(done)
+    if untouched:          # still the kit's copy: record the new one, so the next update sees it untouched
+        lock["files"][GATES_WORKFLOW] = sha(done.encode())
+        save_lock(root, lock)
+    print(f"✔ {GATES_WORKFLOW} now listens to pull_request_target alone. Commit it"
+          + (f" with {LOCK_NAME}" if untouched else "") + " and open a PR: main's copy of the gate judges it.")
+
+
+def latest_release():
+    """Latest published kit release tag, or None (no network, rate limit, etc.)."""
+    req = urllib.request.Request(f"https://api.github.com/repos/{KIT_REPO}/releases/latest",
+                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "haam-tool"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read()).get("tag_name")
+    except Exception:
+        return None
+
+
+def cmd_version(args):
+    root = find_repo_root(Path.cwd())
+    lock = load_lock(root)
+    info = {"tool": VERSION, "project": lock.get("kit_version"), "latest": None}
+    if args.check:
+        info["latest"] = latest_release()
+    if args.json:
+        print(json.dumps(info, indent=2))
+        return
+    print(f"HAAM tool:        {VERSION}")
+    print(f"This project:     {info['project'] or 'not recorded (no haam.lock.json)'}")
+    if args.check:
+        latest = info["latest"]
+        print(f"Latest release:   {latest or 'unknown (offline or not published yet)'}")
+        if latest and info["project"] and version_tuple(latest) > version_tuple(info["project"]):
+            print(f"\nUpdate available. See {KIT_URL}/releases and run /haam-update.")
+
+
+# ----------------------------------------------------------------------------- config
+
+def apply_renames(root, cfg, rep, dry_run=False):
+    old_key = cfg["_applied"].get("team_key", PLACEHOLDER_KEY)
+    new_key = cfg["team_key"].upper()
+    changed = 0
+    key_re = re.compile(rf"\b{re.escape(old_key)}\b")
+    branch_re = re.compile(rf"\b{re.escape(old_key.lower())}-(\d)")
+    product = cfg.get("product_name", "")
+    lock = load_lock(root)
+    lock_changed = False
+    for p in iter_text_files(root, RENAME_ROOTS):
+        try:
+            text = p.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        new = text
+        if old_key != new_key:
+            new = key_re.sub(new_key, new)
+            new = branch_re.sub(lambda m: f"{new_key.lower()}-{m.group(1)}", new)
+        if product:
+            new = new.replace("`TODO(setup): product name`", product)
+        if new_key != PLACEHOLDER_KEY:
+            new = new.replace(" (`TODO(setup)`: replace with your team key everywhere)", "")
+        if new != text:
+            changed += 1
+            if not dry_run:
+                p.write_text(new)
+                rel = p.relative_to(root).as_posix()
+                # Keep the lock in step: a kit file renamed by config is still "unmodified by the project".
+                if lock["files"].get(rel) == sha(text.encode()):
+                    lock["files"][rel] = sha(new.encode())
+                    lock_changed = True
+    if lock_changed:
+        save_lock(root, lock)
+    if not dry_run:
+        cfg["_applied"]["team_key"] = new_key
+        if product:
+            cfg["_applied"]["product_name"] = product
+    if old_key != new_key:
+        rep.add("ok", f"Team key {old_key} → {new_key} applied", f"{changed} files updated")
+    elif changed:
+        rep.add("ok", "Product name applied", f"{changed} files updated")
+
+
+def cmd_config(args):
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    rep = Report()
+    rep.section("Project configuration")
+    owner_flags = [f for f, v in (("--flow", args.flow), ("--deploy", args.deploy), ("--protected", args.protected),
+                                  ("--unprotected", args.unprotected), ("--max-open-prs", args.max_open_prs),
+                                  ("--max-in-uat", args.max_in_uat), ("--until", args.until),
+                                  ("--production", args.production), ("--not-production", args.not_production),
+                                  ("--remove-not-production", args.remove_not_production),
+                                  ("--end-batch-window", args.end_batch_window or None),
+                                  ("--required-fields", args.required_fields),
+                                  ("--required-epic-fields", args.required_epic_fields),
+                                  ("--worktree-dir", args.worktree_dir), ("--release-target", args.release_target),
+                                  ("--clear-release-targets", args.clear_release_targets or None)) if v is not None]
+    if owner_flags and (root / CONFIG_NAME).exists() and not args.human:
+        sys.exit(f"{', '.join(owner_flags)}: these are the owner's settings. Change them inside /haam-settings (or "
+                 "/haam-setup) after the human chose, with --human.")
+    if owner_flags and git_paths(root)[2]:
+        sys.exit("Settings change only from the owner's own chat in the main project folder, never from an agent's worktree.")
+    if (args.flow or setting_value(cfg, "flow")) == "checks-first" and setting_value(cfg, "grouping") == "release":
+        sys.exit("grouping release needs flow test-first: in checks-first every change already has its own PR.")
+
+    detected = detect_github_repo(root)
+    if args.tracker is not None:
+        if args.tracker not in TRACKERS:
+            sys.exit(f"--tracker must be one of: {', '.join(TRACKERS)}")
+        cfg["tracker"] = args.tracker
+    elif not (root / CONFIG_NAME).exists() and is_tty():
+        t = ask("Where do you track work: github (GitHub Projects, free) or linear", "github").lower()
+        cfg["tracker"] = t if t in TRACKERS else "github"
+    if args.project_number is not None:
+        cfg["github_project_number"] = int(args.project_number)
+    if args.project_owner is not None:
+        cfg["github_project_owner"] = args.project_owner
+    fields = [
+        ("product_name", args.product, "Product name (e.g. Acme)"),
+        ("team_key", args.team_key, "Short product key, 2-5 capital letters (e.g. ACM); used as the Linear team key"),
+        ("linear_team_name", args.linear_team if cfg.get("tracker") == "linear" else (args.linear_team or None),
+         "Linear team name"),
+        ("github_repo", args.github_repo or (detected if not cfg["github_repo"] else None), "GitHub repo owner/name"),
+        ("product_owner_github", args.owner, "Product owner's GitHub username (approves deploys)"),
+        ("production_url", args.production_url, "Production URL (for the smoke test; blank if none)"),
+    ]
+    for key, flag_val, prompt in fields:
+        if flag_val is not None and flag_val != "":
+            cfg[key] = flag_val
+        elif not cfg.get(key) and is_tty():
+            default = ""
+            if key == "linear_team_name":
+                default = cfg.get("product_name", "")
+            if key == "team_key":
+                default = cfg.get("team_key", "")
+            cfg[key] = ask(prompt, default)
+    if args.backup_approvers is not None:
+        cfg["backup_approvers_github"] = [x.strip() for x in args.backup_approvers.split(",") if x.strip()]
+    if args.agents is not None:
+        cfg["agents"] = [x.strip().lower() for x in args.agents.split(",") if x.strip()]
+    if args.release_target or args.clear_release_targets:
+        targets = {} if args.clear_release_targets else dict(cfg.get("release_targets") or {})
+        for spec in args.release_target or []:
+            name, _, pats = spec.partition("=")
+            pats = [x.strip() for x in pats.split(",") if x.strip()]
+            if not name.strip() or not pats:
+                sys.exit(f"--release-target {spec!r}: give NAME=PATTERNS, e.g. ios='apps/ios/**,packages/core/**'")
+            targets[name.strip()] = pats
+        cfg["release_targets"] = targets
+    if args.protected or args.unprotected:
+        cur = list(cfg.get("protected_paths") or [])
+        for x in (args.protected or "").split(","):
+            if x.strip() and x.strip() not in cur:
+                cur.append(x.strip())
+        drop = {x.strip() for x in (args.unprotected or "").split(",") if x.strip()}
+        cfg["protected_paths"] = [x for x in cur if x not in drop]
+        tracked = git_out(root, "ls-files").splitlines()
+        for x in (args.protected or "").split(","):
+            if x.strip() and tracked and not protected_matches([x.strip()], tracked):
+                rep.add("warn", f"Protected pattern '{x.strip()}' matches no file in the repository",
+                        "check the spelling (e.g. src/auth/** for everything in src/auth)")
+    if args.production is not None:
+        cfg["production_paths"] = [x.strip() for x in args.production.split(",") if x.strip()] or ["**"]
+        tracked = git_out(root, "ls-files").splitlines()
+        for x in cfg["production_paths"]:
+            if tracked and not protected_matches([x], tracked):
+                rep.add("warn", f"Production pattern '{x}' matches no file in the repository", "check the spelling")
+    if args.not_production or args.remove_not_production:
+        cur = list(cfg.get("non_production_paths") if cfg.get("non_production_paths") is not None
+                   else NON_PRODUCTION_DEFAULT)
+        cur += [x.strip() for x in (args.not_production or "").split(",") if x.strip() and x.strip() not in cur]
+        drop = {x.strip() for x in (args.remove_not_production or "").split(",") if x.strip()}
+        cfg["non_production_paths"] = [x for x in cur if x not in drop]
+    if args.language:
+        if args.language != cfg.get("language") and (root / CONFIG_NAME).exists():
+            rep.add("info", f"Language: {LANGUAGES[args.language]}", "to switch the installed docs, run the kit's "
+                    "update: python3 <kit>/template/tools/haam/haam.py update --target . --apply")
+        cfg["language"] = args.language
+    elif not cfg.get("language"):
+        cfg["language"] = load_lock(root).get("language") or "en"
+    if args.clear_heavy_runs:
+        cfg["heavy_runs"] = []
+    for x in args.heavy_run or []:
+        if x.strip() and x.strip() not in (cfg.get("heavy_runs") or []):
+            cfg["heavy_runs"] = list(cfg.get("heavy_runs") or []) + [x.strip()]
+    if args.flow is not None:
+        if args.flow not in ("test-first", "checks-first"):
+            sys.exit("--flow must be test-first (owner tests before the PR) or checks-first (PR and checks, then test)")
+        cfg["flow"] = args.flow
+    if args.deploy is not None:
+        if args.deploy not in ("github", "manual"):
+            sys.exit("--deploy must be github (deploy.yml runs on merge) or manual (you deploy by hand)")
+        cfg["deploy"] = args.deploy
+    limits = {k: int(v) for k, v in (("max_open_prs", args.max_open_prs), ("max_in_uat", args.max_in_uat)) if v is not None}
+    if args.until:
+        # A temporary raise on this computer, outside haam.config.json: the normal limits stay as they are.
+        active = open_limit_windows(root, limits, args.until)
+        rep.add("ok", "Settings window on this computer: " + ", ".join(window_line(k, active[k]) for k in limits))
+    else:
+        cfg.update(limits)
+    if args.end_batch_window:
+        cfg.pop("batch_window", None)
+        change_windows(root, cleared=("max_open_prs", "max_in_uat"))
+    if args.required_fields is not None:
+        cfg["required_issue_fields"] = [x.strip() for x in args.required_fields.split(",") if x.strip()]
+    if args.required_epic_fields is not None:
+        cfg["required_epic_fields"] = [x.strip() for x in args.required_epic_fields.split(",") if x.strip()]
+    if args.worktree_dir is not None:
+        cfg["worktree_dir"] = args.worktree_dir.strip() or WORKTREE_DIR
+
+    cfg["team_key"] = (cfg.get("team_key") or PLACEHOLDER_KEY).upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9]{1,6}", cfg["team_key"]):
+        sys.exit(f"Team key '{cfg['team_key']}' should be 2-7 capital letters/digits, starting with a letter.")
+    if cfg["github_repo"] and not re.fullmatch(r"[\w.-]+/[\w.-]+", cfg["github_repo"]):
+        sys.exit(f"github_repo should look like owner/name, got '{cfg['github_repo']}'.")
+    if not cfg.get("linear_team_name"):
+        cfg["linear_team_name"] = cfg.get("product_name", "")
+
+    apply_renames(root, cfg, rep, dry_run=args.dry_run)
+    if not args.dry_run:
+        save_config(root, cfg)
+    if cfg.get("tracker") == "github":
+        unlinked = remove_linear_connection(root, apply=not args.dry_run)
+        if unlinked:
+            rep.add("ok", "Linear connection taken out (work is tracked on GitHub)", ", ".join(unlinked))
+
+    missing = [k for k in ("product_name", "github_repo", "product_owner_github") if not cfg.get(k)]
+    for k in ("product_name", "tracker", "team_key", "github_repo", "product_owner_github",
+              "production_url", "agents", "deploy", "flow", "max_open_prs", "max_in_uat", "protected_paths",
+              "production_paths", "non_production_paths", "heavy_runs", "language", "worktree_dir",
+              "required_issue_fields") + (("linear_team_name",) if cfg.get("tracker") == "linear" else ()):
+        v = cfg.get(k)
+        empty_ok = k in ("heavy_runs", "required_issue_fields")
+        rep.add("ok" if v or empty_ok else "warn", f"{k}: {v if v not in (None, []) else '(not set)'}")
+    if missing:
+        rep.action(WHO_AGENT, "Ask the human for the missing values, then re-run with flags",
+                   "python3 tools/haam/haam.py config --product NAME --tracker github --team-key KEY --github-repo owner/name --owner USER")
+    if not missing:
+        nxt = "github-project" if cfg.get("tracker") == "github" else "linear"
+        rep.action(WHO_AGENT if nxt == "github-project" else WHO_TERMINAL,
+                   f"Set up the tracker ({'GitHub Projects' if nxt == 'github-project' else 'Linear'})",
+                   f"python3 tools/haam/haam.py {nxt}  →  then with --apply")
+    rep.add("info", f"Saved to {CONFIG_NAME} (commit it; it holds no secrets)" if not args.dry_run else "Dry run: not saved")
+    rep.print(args.json)
+
+
+# ----------------------------------------------------------------------------- agents
+
+def ensure_skill_link(root, rel, apply, rep):
+    link = root / rel
+    target_rel = os.path.relpath(root / ".agents" / "skills", link.parent)
+    if link.is_symlink():
+        if os.readlink(link) == target_rel and link.resolve() == (root / ".agents/skills").resolve():
+            rep.add("ok", f"{rel} → .agents/skills")
+            return
+        rep.add("warn", f"{rel} is a link to something else", os.readlink(link))
+        return
+    if link.is_dir():
+        # Existing real folder: move its skills into .agents/skills (no overwrite), then link.
+        extra = [d for d in link.iterdir() if not (root / ".agents/skills" / d.name).exists()]
+        clash = [d.name for d in link.iterdir() if (root / ".agents/skills" / d.name).exists()]
+        if not apply:
+            rep.add("warn", f"{rel} is a folder", f"would move {len(extra)} skill(s) to .agents/skills, then link"
+                    + (f"; name clashes kept in place: {', '.join(clash)}" if clash else ""))
+            return
+        if clash:
+            rep.add("fail", f"{rel}: skills with the same name as HAAM skills", ", ".join(clash))
+            rep.action(WHO_AGENT, f"Rename these skills in {rel} so they don't clash, then re-run agents --apply",
+                       ", ".join(clash))
+            return
+        for d in extra:
+            shutil.move(str(d), str(root / ".agents/skills" / d.name))
+        link.rmdir()
+    if not apply:
+        rep.add("warn", f"{rel} missing", "would link to .agents/skills")
+        return
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target_rel, target_is_directory=True)
+        rep.add("ok", f"{rel} → .agents/skills (linked)")
+    except OSError:
+        shutil.copytree(root / ".agents/skills", link)
+        rep.add("warn", f"{rel}: copied (this system can't create links)",
+                "re-run `haam.py agents --apply` after changing any skill")
+
+
+def cmd_agents(args):
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    rep = Report()
+    rep.section("Shared rules and skills")
+    rep.add("ok" if (root / "AGENTS.md").exists() else "fail", "AGENTS.md (rules for every agent)")
+    skills = sorted(p.parent.name for p in (root / ".agents/skills").glob("*/SKILL.md"))
+    rep.add("ok" if skills else "fail", f".agents/skills: {len(skills)} skills", ", ".join(skills))
+    for rel in SKILL_LINKS:
+        ensure_skill_link(root, rel, args.apply, rep)
+
+    hook_on = secret_hook_on(root)
+    rep.add("ok" if hook_on else "warn", "Git pre-commit secret hook (works for every agent that commits with git)",
+            "on" if hook_on else "off on this machine: run `make hooks`")
+
+    agents = cfg.get("agents") or DEFAULT_CONFIG["agents"]
+    guide = "docs/setup/AGENTS-SETUP.md"
+    linear = cfg.get("tracker") != "github"
+    if not linear:
+        unlinked = remove_linear_connection(root, apply=args.apply)
+        rep.section("Tracker")
+        rep.add("ok" if not unlinked or args.apply else "warn", "GitHub Projects: no Linear connection",
+                ("removed from " if args.apply else "will remove from ") + ", ".join(unlinked) if unlinked else "")
+
+    def present(*names):
+        return any(have(n) for n in names)
+
+    if "claude" in agents:
+        rep.section("Claude Code")
+        cm = root / "CLAUDE.md"
+        points = cm.exists() and "AGENTS.md" in cm.read_text(errors="ignore")
+        rep.add("ok" if points else "fail", "CLAUDE.md points to AGENTS.md",
+                "" if points else ("missing" if not cm.exists() else "it's your old CLAUDE.md: merge it (see .haam/incoming)"))
+        rep.add("ok" if (root / ".claude/settings.json").exists() else "fail",
+                ".claude/settings.json (guard-rails + hooks)")
+        if linear:
+            rep.add("ok" if (root / ".mcp.json").exists() else "fail", ".mcp.json declares Linear")
+        rep.add("info", "CLI " + ("found" if present("claude") else "not found on this machine"))
+    if "cursor" in agents:
+        rep.section("Cursor")
+        rep.add("ok", "Reads AGENTS.md and .agents/skills natively")
+        if linear:
+            rep.add("ok" if (root / ".cursor/mcp.json").exists() else "fail", ".cursor/mcp.json declares Linear")
+        rep.add("info", "Cursor also reads .claude/skills for compatibility; if skills show twice, "
+                        "disable 'Claude skills' compatibility in Cursor settings", "")
+    if "codex" in agents:
+        rep.section("Codex")
+        rep.add("ok", "Reads AGENTS.md and .agents/skills natively")
+        policies = list((root / ".agents/skills").glob("*/agents/openai.yaml"))
+        rep.add("ok" if len(policies) >= 4 else "warn", f"Human-only skills marked explicit-only: {len(policies)}")
+        if linear:
+            rep.add("info", "Linear MCP is configured per user (not per repo) in Codex")
+            rep.action(WHO_TERMINAL, "Each Codex user connects Linear once", f"codex mcp add linear --url {LINEAR_MCP}")
+    if "grok" in agents:
+        rep.section("Grok Build")
+        rep.add("ok" if (root / ".grok/skills").exists() else "warn", ".grok/skills → .agents/skills")
+        if linear:
+            rep.add("ok" if (root / ".mcp.json").exists() else "warn", "Linear via .mcp.json (Grok reads it)")
+        rep.add("warn", "Confirm Grok loads AGENTS.md on first run",
+                f"ask it 'what are the hard rules in this repo?'; if it can't answer, see {guide}")
+    if "gemini" in agents or (root / ".gemini/settings.json").exists():
+        rep.section("Gemini CLI")
+        rep.add("ok" if (root / ".gemini/settings.json").exists() else "warn", ".gemini/settings.json → AGENTS.md")
+    rep.section("GitHub Copilot")
+    rep.add("ok", "Reads AGENTS.md natively")
+
+    if not args.apply:
+        rep.add("info", "Plan only. Re-run with --apply to make changes")
+    if linear:
+        rep.action(WHO_TERMINAL, "Each developer signs in to Linear from their agent tool (OAuth, one time)",
+                   f"see {guide}")
+    rep.print(args.json)
+
+
+# ----------------------------------------------------------------------------- github
+
+def gh_api(method, path, body=None):
+    cmd = ["gh", "api", "-X", method, path, "-H", "Accept: application/vnd.github+json"]
+    if body is not None:
+        cmd += ["--input", "-"]
+    code, out, err = run(cmd, input_text=json.dumps(body) if body is not None else None)
+    data = None
+    if out:
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            data = out
+    return code, data, err
+
+
+def gh_ready(rep, cfg):
+    if not have("gh"):
+        rep.add("fail", "GitHub CLI (gh) not installed")
+        rep.action(WHO_TERMINAL, "Install the GitHub CLI and log in", "https://cli.github.com  then  gh auth login")
+        return False
+    code, _, _ = run(["gh", "auth", "status"])
+    if code != 0:
+        rep.add("fail", "GitHub CLI not logged in")
+        rep.action(WHO_TERMINAL, "Log in to GitHub", "gh auth login")
+        return False
+    if not cfg.get("github_repo"):
+        rep.add("fail", "github_repo not set in haam.config.json")
+        rep.action(WHO_AGENT, "Set the repo", "python3 tools/haam/haam.py config --github-repo owner/name")
+        return False
+    return True
+
+
+def ruleset_body(cfg):
+    return {
+        "name": "HAAM main protection",
+        "target": "branch",
+        "enforcement": "active",
+        # Admins may bypass only when merging a pull request, never by pushing straight to main:
+        # every agent works under a human's login, often an admin's.
+        "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request"}],
+        "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+        "rules": [
+            {"type": "deletion"},
+            {"type": "non_fast_forward"},
+            {"type": "pull_request", "parameters": {
+                "required_approving_review_count": 1 if cfg.get("backup_approvers_github") else 0,
+                "dismiss_stale_reviews_on_push": True,
+                "require_code_owner_review": False,
+                "require_last_push_approval": False,
+                "required_review_thread_resolution": False,
+            }},
+            {"type": "required_status_checks", "parameters": {
+                # Off: "must be up to date before merging" re-runs CI on every open PR after each merge.
+                "strict_required_status_checks_policy": False,
+                "required_status_checks": [{"context": c_} for c_ in required_checks(cfg)],
+            }},
+        ],
+    }
+
+
+# Status checks HAAM itself requires (project-added checks are left alone when settings change).
+HAAM_CHECK_CONTEXTS = {"ci", "ci-local", "secrets", "dependencies", "ai-review", "security-review", "release-gate"}
+
+
+def merge_ruleset(current, wanted):
+    """Add what HAAM needs to an existing ruleset, keeping everything the project set itself.
+    Drops HAAM checks the current settings no longer want (e.g. `ci` when ci is off).
+    Returns (body to PUT, list of changes, list of warnings)."""
+    keep = {k: current.get(k) for k in ("name", "target", "enforcement", "conditions", "bypass_actors")}
+    rules = [dict(r) for r in current.get("rules") or []]
+    changes, notes = [], []
+    types = {r["type"]: r for r in rules}
+    for r in wanted["rules"]:
+        if r["type"] not in types:
+            rules.append(r)
+            changes.append(f"Add the '{r['type']}' rule")
+    checks_rule = next(r for r in rules if r["type"] == "required_status_checks")
+    params = checks_rule.setdefault("parameters", {})
+    want = [c["context"] for c in wanted["rules"][-1]["parameters"]["required_status_checks"]]
+    want_set = set(want)
+    have_list = list(params.get("required_status_checks") or [])
+    have = {c.get("context") for c in have_list}
+    missing = [c for c in want if c not in have]
+    if missing:
+        params["required_status_checks"] = have_list + [{"context": c} for c in missing]
+        params.setdefault("strict_required_status_checks_policy", False)
+        changes.append("Require the check(s) " + ", ".join(missing))
+        have_list = params["required_status_checks"]
+    # Drop HAAM checks the settings no longer require (ci → off removes `ci` / `ci-local`). Leave any
+    # check the project added itself.
+    drop = [c.get("context") for c in have_list
+            if c.get("context") in HAAM_CHECK_CONTEXTS and c.get("context") not in want_set]
+    if drop:
+        params["required_status_checks"] = [c for c in have_list if c.get("context") not in drop]
+        changes.append("Stop requiring the check(s) " + ", ".join(drop))
+    if params.get("strict_required_status_checks_policy"):
+        notes.append("'Branches must be up to date before merging' is on: every merge re-runs CI on all open PRs "
+                     "(costs CI minutes). Turn it off in the ruleset, or run github --apply --reset")
+    if any(a.get("bypass_mode") == "always" for a in keep.get("bypass_actors") or []):
+        notes.append("Admins can bypass the rules 'always': agents working under an admin login could push straight "
+                     "to main. Set bypass to 'pull request only' in the ruleset, or run github --apply --reset")
+    if keep.get("enforcement") != "active":
+        notes.append(f"The ruleset's enforcement is '{keep.get('enforcement')}', not 'active': the gates aren't enforced")
+    body = {k: v for k, v in keep.items() if v is not None}
+    body["rules"] = [{k: v for k, v in r.items() if k in ("type", "parameters")} for r in rules]
+    return body, changes, notes
+
+
+def cmd_github(args):
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    rep = Report()
+    rep.section("GitHub")
+    if not gh_ready(rep, cfg):
+        rep.print(args.json)
+        return
+    repo = cfg["github_repo"]
+    apply = args.apply
+
+    code, info, err = gh_api("GET", f"repos/{repo}")
+    if code != 0:
+        rep.add("fail", f"Can't access {repo}", err)
+        rep.print(args.json)
+        return
+    perms = info.get("permissions", {}) if isinstance(info, dict) else {}
+    rep.add("ok" if perms.get("admin") else "fail", f"Repository {repo}",
+            "you are an admin" if perms.get("admin") else "admin rights needed for this step")
+    if not perms.get("admin"):
+        rep.action(WHO_TERMINAL, "Run `haam.py github` as a repository admin")
+        rep.print(args.json)
+        return
+    private = info.get("private", False)
+
+    # Labels
+    rep.section("Labels")
+    code, out, _ = run(["gh", "label", "list", "-R", repo, "--json", "name", "-L", "200"])
+    existing = {l["name"] for l in json.loads(out)} if code == 0 and out else set()
+    for name, color, desc in GITHUB_LABELS:
+        if name in existing:
+            rep.add("ok", name)
+        elif apply:
+            c2, _, e2 = run(["gh", "label", "create", name, "--color", color, "--description", desc, "-R", repo])
+            rep.add("ok" if c2 == 0 else "fail", f"{name} created" if c2 == 0 else f"{name}", e2)
+        else:
+            rep.add("warn", f"{name} missing", "will create")
+
+    # Auto-merge (the no-UAT lane: PRs whose issues the owner marked uat:skip merge once everything is green)
+    rep.section("Auto-merge")
+    if info.get("allow_auto_merge"):
+        rep.add("ok", "Auto-merge allowed", "for the no-UAT lane (uat:skip)")
+    elif apply:
+        c2, _, e2 = gh_api("PATCH", f"repos/{repo}", {"allow_auto_merge": True})
+        rep.add("ok" if c2 == 0 else "warn", "Auto-merge allowed" if c2 == 0 else "Couldn't allow auto-merge",
+                "for the no-UAT lane (uat:skip)" if c2 == 0 else (e2 or "")[:160])
+    else:
+        rep.add("warn", "Auto-merge not allowed", "will allow it (used only by the no-UAT lane, uat:skip)")
+
+    # Ruleset
+    rep.section("Branch rules on the default branch")
+    code, rulesets, err = gh_api("GET", f"repos/{repo}/rulesets")
+    current = None
+    if code == 0 and isinstance(rulesets, list):
+        current = next((r for r in rulesets if r.get("name") == "HAAM main protection"), None)
+    # The gate settings come from main: a branch's own haam.config.json (an agent's, say) can't lower the rules.
+    gcfg = dict(cfg)
+    base = cfg.get("default_branch") or "main"
+    main_cfg = git_out(root, "show", f"origin/{base}:{CONFIG_NAME}")
+    if main_cfg:
+        try:
+            on_main = json.loads(main_cfg)
+            for k in ("ci", "deploy_approval"):
+                if k in on_main:
+                    gcfg[k] = on_main[k]
+                elif k in gcfg:
+                    gcfg.pop(k)
+            for k in ("ci", "deploy_approval"):
+                if setting_value(gcfg, k) != setting_value(cfg, k):
+                    rep.add("info", f"Using {k}={setting_value(gcfg, k)} from {base}",
+                            f"this copy says {setting_value(cfg, k)}: merge that first for it to count")
+        except json.JSONDecodeError:
+            pass
+    body = ruleset_body(gcfg)
+    if code != 0:
+        rep.add("fail", "Can't read rulesets", (err or "")[:160])
+        rep.action(WHO_BROWSER, "Rulesets on private repos need a paid GitHub plan (Pro/Team). Upgrade, "
+                   "or set equivalent classic branch protection manually (docs/setup/GITHUB-SETUP.md §2)")
+    else:
+        full = None
+        if current:
+            c0, full, _ = gh_api("GET", f"repos/{repo}/rulesets/{current['id']}")
+            full = full if c0 == 0 and isinstance(full, dict) else None
+        if current and not full and not args.reset:
+            rep.add("fail", "Couldn't read the existing ruleset, so it's left unchanged",
+                    "re-run later, or use --reset to replace it with HAAM's defaults")
+        elif current and full and not args.reset:
+            merged, changes, notes = merge_ruleset(full, body)
+            for n in notes:
+                rep.add("warn", n)
+            if not changes:
+                rep.add("ok", "Ruleset 'HAAM main protection' has everything HAAM needs", "your own settings are kept")
+            elif apply:
+                c2, _, e2 = gh_api("PUT", f"repos/{repo}/rulesets/{current['id']}", merged)
+                for ch in changes:
+                    rep.add("ok" if c2 == 0 else "fail", ch)
+                if c2 != 0:
+                    rep.add("fail", "Ruleset not updated", (e2 or "")[:200])
+            else:
+                for ch in changes:
+                    rep.add("warn", f"Will {ch[0].lower() + ch[1:]}", "everything else in your ruleset is kept")
+        elif apply:
+            if current:
+                c2, _, e2 = gh_api("PUT", f"repos/{repo}/rulesets/{current['id']}", body)
+            else:
+                c2, _, e2 = gh_api("POST", f"repos/{repo}/rulesets", body)
+            rep.add("ok" if c2 == 0 else "fail", "Ruleset 'HAAM main protection' " + ("reset to HAAM defaults" if current else "created")
+                    if c2 == 0 else "Ruleset not applied", (e2 or "")[:200])
+            if c2 != 0 and private:
+                rep.action(WHO_BROWSER, "Rulesets on private repos need GitHub Pro/Team. Upgrade or protect the "
+                           "branch manually (docs/setup/GITHUB-SETUP.md §2)")
+        else:
+            rep.add("ok" if current else "warn", "Ruleset 'HAAM main protection'",
+                    "exists: --reset replaces it with HAAM defaults" if current else "will create")
+    rep.add("info", "Required checks: " + ", ".join(required_checks(gcfg)))
+    rep.add("info", "Admins can bypass only when merging a pull request (Level 2 emergency override), never by pushing to main")
+
+    # Production environment
+    rep.section("Production environment (Gate G5)")
+    approvers = [cfg.get("product_owner_github")] + list(cfg.get("backup_approvers_github") or [])
+    approvers = [a for a in approvers if a]
+    if not approvers:
+        rep.add("fail", "No approver configured", "set product_owner_github")
+        rep.action(WHO_AGENT, "Set the approver", "python3 tools/haam/haam.py config --owner USER")
+    else:
+        code, env, _ = gh_api("GET", f"repos/{repo}/environments/production")
+        exists = code == 0
+        if apply:
+            reviewers = []
+            for a in (approvers if setting_value(gcfg, "deploy_approval") != "automatic" else []):
+                c3, uid, _ = run(["gh", "api", f"users/{a}", "--jq", ".id"])
+                if c3 == 0 and uid:
+                    reviewers.append({"type": "User", "id": int(uid)})
+                else:
+                    rep.add("fail", f"GitHub user {a} not found")
+            env_body = {"reviewers": reviewers, "prevent_self_review": False,
+                        "deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}}
+            c2, _, e2 = gh_api("PUT", f"repos/{repo}/environments/production", env_body)
+            if c2 == 0:
+                rep.add("ok", "Environment 'production' with required approval" if reviewers else
+                        "Environment 'production': deploys start on merge (deploy_approval: automatic)",
+                        ", ".join(approvers) if reviewers else "")
+                c4, _, e4 = gh_api("POST", f"repos/{repo}/environments/production/deployment-branch-policies",
+                                   {"name": cfg.get("default_branch", "main"), "type": "branch"})
+                rep.add("ok" if c4 == 0 or "already" in (e4 or "").lower() else "warn",
+                        f"Deploys only from {cfg.get('default_branch', 'main')}", "" if c4 == 0 else (e4 or "")[:120])
+            elif reviewers and private and "422" in (e2 or "") and any(
+                    k in (e2 or "").lower() for k in ("protection rule", "reviewer", "plan", "upgrade", "not available")):
+                # Required reviewers on private repos need GitHub Enterprise Cloud: create the environment without them.
+                env_body["reviewers"] = []
+                c6, _, e6 = gh_api("PUT", f"repos/{repo}/environments/production", env_body)
+                if c6 == 0:
+                    gh_api("POST", f"repos/{repo}/environments/production/deployment-branch-policies",
+                           {"name": cfg.get("default_branch", "main"), "type": "branch"})
+                rep.add("warn" if c6 == 0 else "fail", "Environment 'production' created without a required approver"
+                        if c6 == 0 else "Environment not configured",
+                        "your GitHub plan doesn't allow required reviewers on private repos (only GitHub Enterprise "
+                        "Cloud does). Deploys start as soon as a PR merges, so G5 is your 'ship' in /test." if c6 == 0 else (e6 or "")[:200])
+            else:
+                rep.add("fail", "Environment not configured", (e2 or "")[:200])
+            if cfg.get("production_url"):
+                c5, _, _ = run(["gh", "variable", "set", "PRODUCTION_URL", "--env", "production",
+                                "--body", cfg["production_url"], "-R", repo])
+                rep.add("ok" if c5 == 0 else "warn", "PRODUCTION_URL variable set")
+        else:
+            rep.add("ok" if exists else "warn", "Environment 'production'",
+                    "exists (approvers will be refreshed)" if exists else "will create with approvers: " + ", ".join(approvers))
+
+    # Security features
+    rep.section("Security features")
+    sec = info.get("security_and_analysis") or {}
+    for feat, label in (("secret_scanning", "Secret scanning"), ("secret_scanning_push_protection", "Push protection")):
+        on = (sec.get(feat) or {}).get("status") == "enabled"
+        if on:
+            rep.add("ok", label)
+        elif apply:
+            c2, _, e2 = gh_api("PATCH", f"repos/{repo}", {"security_and_analysis": {feat: {"status": "enabled"}}})
+            rep.add("ok" if c2 == 0 else "warn", label + (" enabled" if c2 == 0 else " not available"),
+                    "" if c2 == 0 else "may need a paid plan for private repos; the kit's own `secrets` check still protects you")
+        else:
+            rep.add("warn", label + " off", "will try to enable")
+    if apply:
+        c2, _, _ = gh_api("PUT", f"repos/{repo}/vulnerability-alerts")
+        c3, _, _ = gh_api("PUT", f"repos/{repo}/automated-security-fixes")
+        rep.add("ok" if c2 == 0 else "warn", "Dependabot alerts")
+        rep.add("ok" if c3 == 0 else "warn", "Dependabot security updates")
+    else:
+        rep.add("info", "Dependabot alerts and security updates", "will enable")
+
+    # Secrets
+    rep.section("Secrets (never handled by agents)")
+    code, out, _ = run(["gh", "secret", "list", "-R", repo, "--json", "name"])
+    names = {s["name"] for s in json.loads(out)} if code == 0 and out else set()
+    if "ANTHROPIC_API_KEY" in names:
+        rep.add("ok", "ANTHROPIC_API_KEY (both reviewer agents; billed per review)")
+    elif "CLAUDE_CODE_OAUTH_TOKEN" in names:
+        rep.add("ok", "CLAUDE_CODE_OAUTH_TOKEN (both reviewer agents run on your Claude plan)")
+    else:
+        rep.add("fail", "No key for the reviewer agents", "set CLAUDE_CODE_OAUTH_TOKEN (your Claude plan) or ANTHROPIC_API_KEY")
+        rep.action(WHO_TERMINAL, "Either run `claude setup-token` and paste the token it prints, or create a dedicated "
+                   "API key with a spend limit at console.anthropic.com and paste that. The command asks for it "
+                   "without showing it; it isn't stored anywhere else",
+                   f"gh secret set CLAUDE_CODE_OAUTH_TOKEN -R {repo}   (or: gh secret set ANTHROPIC_API_KEY -R {repo})")
+
+    rep.section("Manual steps GitHub doesn't expose to the tool")
+    rep.add("info", "Fork PRs: Settings → Actions → General → require approval for outside collaborators")
+    rep.action(WHO_BROWSER, "Require approval for workflows from fork PRs",
+               f"https://github.com/{repo}/settings/actions")
+    rep.add("info", "Optional once you have 2+ humans: CODEOWNERS for protected areas (docs/setup/GITHUB-SETUP.md §5)")
+
+    if not apply:
+        rep.add("info", "Plan only. Re-run with --apply to make these changes")
+    rep.print(args.json)
+
+
+# ----------------------------------------------------------------------------- linear
+
+class Linear:
+    def __init__(self, key):
+        self.key = key
+        self._mutations = None
+
+    def q(self, query, variables=None):
+        req = urllib.request.Request(
+            LINEAR_API,
+            data=json.dumps({"query": query, "variables": variables or {}}).encode(),
+            headers={"Content-Type": "application/json", "Authorization": self.key},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="ignore")[:300]
+            raise RuntimeError(f"Linear API HTTP {e.code}: {body}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Can't reach Linear: {e.reason}")
+        if data.get("errors"):
+            raise RuntimeError("; ".join(err.get("message", "") for err in data["errors"]))
+        return data["data"]
+
+    def has_mutation(self, name):
+        if self._mutations is None:
+            d = self.q("{ __schema { mutationType { fields { name } } } }")
+            self._mutations = {f["name"] for f in d["__schema"]["mutationType"]["fields"]}
+        return name in self._mutations
+
+    def input_fields(self, type_name):
+        d = self.q('query($n:String!){ __type(name:$n){ inputFields { name } } }', {"n": type_name})
+        t = d.get("__type") or {}
+        return {f["name"] for f in t.get("inputFields") or []}
+
+
+def linear_key(rep):
+    key = os.environ.get("LINEAR_API_KEY", "").strip()
+    if key:
+        return key
+    if is_tty():
+        print("A Linear personal API key is needed (Linear → Settings → Security & access → Personal API keys).")
+        print("It is used for this run only: not shown, not saved.")
+        key = getpass.getpass("Linear API key: ").strip()
+        return key or None
+    rep.add("fail", "No Linear API key available to this session")
+    rep.action(WHO_TERMINAL, "Agents never handle API keys. Run this step yourself in a terminal; "
+               "it will ask for your Linear personal API key securely",
+               "python3 tools/haam/haam.py linear --apply")
+    return None
+
+
+TEAM_FIELDS = "id key name triageEnabled states { nodes { id name type position } }"
+
+
+def cmd_linear(args):
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    rep = Report()
+    rep.section("Linear")
+    if cfg.get("tracker") == "github":
+        rep.add("warn", "This project's tracker is GitHub Projects", "use `haam.py github-project`, or switch with `config --tracker linear`")
+    key = linear_key(rep)
+    if not key:
+        rep.print(args.json)
+        return
+    lin = Linear(key)
+    apply = args.apply
+    team_key = cfg["team_key"]
+    team_name = cfg.get("linear_team_name") or cfg.get("product_name") or team_key
+
+    try:
+        me = lin.q("{ viewer { name email organization { name } } }")["viewer"]
+        rep.add("ok", f"Connected as {me['name']}", f"workspace: {me['organization']['name']}")
+
+        teams = lin.q('query($k:String!){ teams(filter:{key:{eq:$k}}) { nodes { %s } } }' % TEAM_FIELDS,
+                      {"k": team_key})["teams"]["nodes"]
+        team = teams[0] if teams else None
+        rep.section(f"Team {team_key}")
+        if team:
+            rep.add("ok", f"Team '{team['name']}' ({team_key}) exists")
+        elif apply:
+            d = lin.q('mutation($i:TeamCreateInput!){ teamCreate(input:$i){ success team { %s } } }' % TEAM_FIELDS,
+                      {"i": {"name": team_name, "key": team_key}})
+            team = d["teamCreate"]["team"]
+            rep.add("ok", f"Team '{team_name}' ({team_key}) created")
+        else:
+            rep.add("warn", f"Team {team_key} not found", f"will create '{team_name}'")
+
+        # Triage
+        if team and not team.get("triageEnabled"):
+            if apply:
+                lin.q('mutation($id:String!,$i:TeamUpdateInput!){ teamUpdate(id:$id,input:$i){ success } }',
+                      {"id": team["id"], "i": {"triageEnabled": True}})
+                rep.add("ok", "Triage turned on")
+                team = lin.q('query($id:String!){ team(id:$id){ %s } }' % TEAM_FIELDS, {"id": team["id"]})["team"]
+            else:
+                rep.add("warn", "Triage off", "will turn on")
+        elif team:
+            rep.add("ok", "Triage on")
+
+        # States
+        rep.section("Workflow statuses")
+        states = {s["name"].lower(): s for s in (team["states"]["nodes"] if team else [])}
+        for pos, (name, typ, color) in enumerate(LINEAR_STATES):
+            s = states.get(name.lower())
+            if s:
+                if s["type"] != typ:
+                    rep.add("warn", f"{name} exists but is type '{s['type']}', expected '{typ}'",
+                            "change it in Linear → Team settings → Workflow")
+                else:
+                    rep.add("ok", name)
+                continue
+            if typ == "triage":
+                rep.add("warn" if not apply else "info", name, "created by turning on Triage")
+                continue
+            # Linear's default 'Todo' becomes our 'Ready'
+            if name == "Ready" and "todo" in states and states["todo"]["type"] == "unstarted":
+                if apply:
+                    lin.q('mutation($id:String!,$i:WorkflowStateUpdateInput!){ workflowStateUpdate(id:$id,input:$i){ success } }',
+                          {"id": states["todo"]["id"], "i": {"name": "Ready"}})
+                    rep.add("ok", "Todo renamed to Ready")
+                else:
+                    rep.add("warn", "Ready missing", "will rename Todo → Ready")
+                continue
+            if apply and team:
+                lin.q('mutation($i:WorkflowStateCreateInput!){ workflowStateCreate(input:$i){ success } }',
+                      {"i": {"teamId": team["id"], "name": name, "type": typ, "color": color, "position": float(pos)}})
+                rep.add("ok", f"{name} created")
+            else:
+                rep.add("warn", f"{name} missing", "will create")
+        wanted = {n.lower() for n, _, _ in LINEAR_STATES} | {"todo"}
+        for n, s in states.items():
+            if n not in wanted:
+                rep.add("warn", f"Extra status '{s['name']}'", "not used by HAAM: archive it in Linear if no issues use it")
+
+        # Labels
+        rep.section("Labels")
+        label_nodes = []
+        after = None
+        while True:
+            d = lin.q('query($a:String){ issueLabels(first:250, after:$a){ nodes { id name team { id } } '
+                      'pageInfo { hasNextPage endCursor } } }', {"a": after})["issueLabels"]
+            label_nodes += d["nodes"]
+            if not d["pageInfo"]["hasNextPage"]:
+                break
+            after = d["pageInfo"]["endCursor"]
+        usable = {l["name"].lower() for l in label_nodes
+                  if l.get("team") is None or (team and l["team"] and l["team"]["id"] == team["id"])}
+        for name, color, desc in LINEAR_LABELS:
+            if name.lower() in usable:
+                rep.add("ok", name)
+            elif apply and team:
+                lin.q('mutation($i:IssueLabelCreateInput!){ issueLabelCreate(input:$i){ success } }',
+                      {"i": {"name": name, "color": color, "description": desc, "teamId": team["id"]}})
+                rep.add("ok", f"{name} created")
+            else:
+                rep.add("warn", f"{name} missing", "will create")
+
+    except RuntimeError as e:
+        rep.add("fail", "Linear API error", str(e)[:300])
+        rep.action(WHO_BROWSER, "Do the remaining Linear steps by hand", "docs/setup/LINEAR-SETUP.md")
+
+    rep.section("Manual steps in Linear (no API for these)")
+    for t in ["Connect GitHub: Settings → Integrations → GitHub",
+              "PR automations: PR opened → In Review; PR merged → Deploying",
+              "Branch name format: {issue-identifier}-{issue-title} (no username prefix)",
+              "Saved views: Waiting on me, Agent queue, Ideas inbox, Bugs, Epics, Overrides to close",
+              "Delete Linear's sample statuses you don't need (e.g. Duplicate)"]:
+        rep.add("info", t)
+    rep.action(WHO_BROWSER, "Finish the Linear settings listed above", "docs/setup/LINEAR-SETUP.md §6–7")
+    if not apply:
+        rep.add("info", "Plan only. Re-run with --apply to make these changes")
+    rep.print(args.json)
+
+
+# ----------------------------------------------------------------------------- github projects
+
+# Statuses as a single-select "Status" field on the board: (name, colour, description)
+GH_STATUSES = [
+    ("Triage", "ORANGE", "New idea or bug, not assessed"),
+    ("Discovery", "GRAY", "Being assessed"),
+    ("Decision", "YELLOW", "Waiting for a human decision (G1)"),
+    ("Backlog", "GRAY", "Approved, needs a spec"),
+    ("Ready", "BLUE", "Spec approved (G2): agents may build"),
+    ("In Progress", "YELLOW", "Claimed and being built"),
+    ("In Review", "PURPLE", "PR open: checks and AI review (G3)"),
+    ("UAT", "PINK", "Waiting for human testing (G4)"),
+    ("Deploying", "GREEN", "Merged: waiting for production approval (G5)"),
+    ("Done", "GREEN", "Released"),
+    ("Parked", "GRAY", "Good idea, not now"),
+    ("Canceled", "RED", "Will not do"),
+]
+GH_PRIORITIES = [
+    ("Urgent", "RED", "Production broken or deadline at risk"),
+    ("High", "ORANGE", "Important for current goals"),
+    ("Medium", "YELLOW", "Normal"),
+    ("Low", "GRAY", "Nice to have"),
+]
+# Issue labels used on GitHub when the tracker is GitHub Projects
+GH_ISSUE_LABELS = [
+    ("stream:idea", "BB87FC", "New idea, not yet decided"),
+    ("stream:feature", "4EA7FC", "Approved work"),
+    ("stream:bug", "EB5757", "Something is broken"),
+    ("agent-ready", "4CB782", "Passed G2: agents may build it"),
+    ("human-only", "95A2B3", "Agents must not pick this up"),
+    ("override-followup", "FC7840", "Created after a gate override"),
+    ("epic", "3E4B9E", "Groups the issues that make up one feature (its sub-issues)"),
+    ("uat-failed", "D93F0B", "Failed the human test: rework first, then test again"),
+    ("uat:skip", "C2E0C6", "Owner decided: no UAT; merges once the checks and reviews pass"),
+    ("claimed", "FBCA04", "An agent chat is assessing it or writing its spec: leave it to that chat"),
+    ("mode:prototype", "D4C5F9", "Owner decided: an agent builds a throwaway prototype first (/spike)"),
+    ("mode:epic-build", "3E4B9E", "Owner decided: one lead agent builds this whole epic, slice by slice"),
+    ("spike-ready", "D4C5F9", "A prototype is ready for the owner to try (/test)"),
+]
+CLAIMED_LABEL = "claimed"
+CLAIM_MARK, RELEASE_MARK = "🤖 Claimed by", "🔓 Claim released"
+UAT_FAILED_LABEL, FAILED_MARK, REWORK_MARK = "uat-failed", "❌ UAT failed", "🔁 Rework, round"
+CLAIM_RACE_MINUTES = 10
+EPIC_LABEL = "epic"
+# Issue labels only a human's decision adds (agents pass --human only inside the skill where the human decided)
+HUMAN_LABELS = {"agent-ready": "agent-ready is added only after a human approves the spec",
+                "uat:skip": "uat:skip (no UAT, merges by itself) is the owner's decision",
+                "mode:prototype": "mode:prototype (an agent builds a prototype first) is the owner's decision",
+                "mode:epic-build": "mode:epic-build (one agent builds the whole epic) is the owner's decision",
+                "verified-by-agents": "verified-by-agents is recorded only by `haam.py verify-result`"}
+# Moving into these needs a human decision (they're done through human-only skills)
+HUMAN_STATUSES = {"Done", "Parked", "Canceled"}
+PROJECT_TOKEN_SECRET = "HAAM_PROJECT_TOKEN"
+
+
+def gql(query, variables=None):
+    """GitHub GraphQL through the gh CLI (uses the caller's own login or GH_TOKEN)."""
+    body = json.dumps({"query": query, "variables": variables or {}})
+    code, out, err = run(["gh", "api", "graphql", "--input", "-"], input_text=body)
+    data = None
+    if out:
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            pass
+    msg = ""
+    if data and data.get("errors"):
+        msg = "; ".join(e.get("message", "") for e in data["errors"])
+    elif code != 0:
+        msg = err or out
+    if msg:
+        if "INSUFFICIENT_SCOPES" in msg or "required scopes" in msg or "'project'" in msg:
+            raise RuntimeError("Your GitHub login can't use Projects yet. Run in your terminal: gh auth refresh -s project")
+        raise RuntimeError(msg[:400])
+    return (data or {}).get("data") or {}
+
+
+PROJECT_FIELDS = """
+  id number url title
+  items(first: 1) { totalCount }
+  fields(first: 50) { nodes { __typename
+    ... on ProjectV2FieldCommon { id name dataType }
+    ... on ProjectV2SingleSelectField { options { id name } }
+    ... on ProjectV2IterationField { configuration { iterations { id title startDate duration } } } } }
+"""
+# An item's field values, for every kind of field a project can add itself
+FIELD_VALUES = """fieldValues(first:50){ nodes{
+  ... on ProjectV2ItemFieldSingleSelectValue { name field{ ... on ProjectV2FieldCommon { name } } }
+  ... on ProjectV2ItemFieldTextValue { text field{ ... on ProjectV2FieldCommon { name } } }
+  ... on ProjectV2ItemFieldNumberValue { number field{ ... on ProjectV2FieldCommon { name } } }
+  ... on ProjectV2ItemFieldDateValue { date field{ ... on ProjectV2FieldCommon { name } } }
+  ... on ProjectV2ItemFieldIterationValue { title field{ ... on ProjectV2FieldCommon { name } } } } }"""
+# Board fields a project adds itself (Area, Team, Sprint…), which `issue … --field NAME=VALUE` sets. Status and
+# Priority have HAAM's own commands and rules.
+CUSTOM_FIELD_TYPES = ("SINGLE_SELECT", "TEXT", "NUMBER", "DATE", "ITERATION")
+HAAM_FIELDS = ("Status", "Priority")
+
+
+def field_values(nodes):
+    """{field name: value} from an item's fieldValues nodes."""
+    out = {}
+    for v in nodes or []:
+        if not v or not v.get("field"):
+            continue
+        for k in ("name", "text", "number", "date", "title"):
+            if v.get(k) is not None:
+                val = v[k]
+                out[v["field"]["name"]] = int(val) if isinstance(val, float) and val.is_integer() else val
+                break
+    return out
+
+
+def parse_field_args(items):
+    """['Area=Billing', 'Sprint=@current'] → [('Area', 'Billing'), …]."""
+    out = []
+    for x in items or []:
+        name, sep, value = x.partition("=")
+        if not sep or not name.strip():
+            raise RuntimeError(f"--field takes NAME=VALUE (e.g. --field Area=Billing), not '{x}'")
+        out.append((name.strip(), value.strip()))
+    return out
+
+
+class GHProject:
+    """The GitHub Projects board for this repository."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.repo = cfg.get("github_repo") or ""
+        if "/" not in self.repo:
+            raise RuntimeError("github_repo isn't set: python3 tools/haam/haam.py config --github-repo owner/name")
+        self.repo_owner, self.repo_name = self.repo.split("/", 1)
+        self.owner = cfg.get("github_project_owner") or self.repo_owner
+        self.number = cfg.get("github_project_number")
+        self.data = None
+
+    # --- board
+    def load(self):
+        if not self.number:
+            raise RuntimeError("No board configured. Run: python3 tools/haam/haam.py github-project --apply")
+        d = gql("query($o:String!,$n:Int!){ repositoryOwner(login:$o){ ... on ProjectV2Owner { projectV2(number:$n){ %s } } } }"
+                % PROJECT_FIELDS, {"o": self.owner, "n": int(self.number)})
+        proj = ((d.get("repositoryOwner") or {}).get("projectV2"))
+        if not proj:
+            raise RuntimeError(f"Board #{self.number} not found for {self.owner}, or no access to it")
+        self.data = proj
+        return proj
+
+    def field(self, name):
+        for f in (self.data or self.load())["fields"]["nodes"]:
+            if f.get("name") == name:
+                return f
+        return None
+
+    def option_id(self, field_name, option):
+        f = self.field(field_name)
+        if not f:
+            raise RuntimeError(f"The board has no '{field_name}' field. Run: python3 tools/haam/haam.py github-project --apply")
+        for o in f.get("options") or []:
+            if o["name"].lower() == option.lower():
+                return f["id"], o["id"]
+        valid = ", ".join(o["name"] for o in f.get("options") or [])
+        raise RuntimeError(f"'{option}' isn't a {field_name} on the board (valid: {valid})")
+
+    def field_type(self, f):
+        return f.get("dataType") or ("SINGLE_SELECT" if "options" in f else None)
+
+    def custom_fields(self):
+        """The board's own fields that --field can set, with their options."""
+        out = []
+        for f in (self.data or self.load())["fields"]["nodes"]:
+            t = self.field_type(f)
+            if f.get("name") and t in CUSTOM_FIELD_TYPES and f["name"] not in HAAM_FIELDS:
+                opts = ([o["name"] for o in f.get("options") or []] if t == "SINGLE_SELECT" else
+                        [i["title"] for i in ((f.get("configuration") or {}).get("iterations") or [])] if t == "ITERATION"
+                        else [])
+                out.append({"name": f["name"], "type": t.lower().replace("_", "-"), "options": opts})
+        return out
+
+    def resolve_field(self, name, value):
+        """Check NAME=VALUE against the board before anything changes: returns (field id, value input or None to
+        clear, display value)."""
+        f = next((x for x in (self.data or self.load())["fields"]["nodes"]
+                  if (x.get("name") or "").lower() == name.lower()), None)
+        own = ", ".join(c["name"] for c in self.custom_fields()) or "none"
+        if not f:
+            raise RuntimeError(f"The board has no field '{name}' (its own fields: {own}; `issue fields` lists them)")
+        if f["name"] in HAAM_FIELDS:
+            raise RuntimeError(f"Set {f['name']} with --{f['name'].lower()} or `issue {f['name'].lower()}`: it follows "
+                               "HAAM's rules")
+        t = self.field_type(f)
+        if t not in CUSTOM_FIELD_TYPES:
+            raise RuntimeError(f"'{f['name']}' is filled in by GitHub ({(t or '?').lower()}); --field sets the board's "
+                               f"own fields: {own}")
+        if value == "":
+            return f["id"], None, ""
+        if t == "SINGLE_SELECT":
+            o = next((o for o in f.get("options") or [] if o["name"].lower() == value.lower()), None)
+            if not o:
+                raise RuntimeError(f"'{value}' isn't an option of {f['name']} (options: "
+                                   f"{', '.join(x['name'] for x in f.get('options') or [])})")
+            return f["id"], {"singleSelectOptionId": o["id"]}, o["name"]
+        if t == "NUMBER":
+            try:
+                return f["id"], {"number": float(value)}, value
+            except ValueError:
+                raise RuntimeError(f"{f['name']} takes a number, not '{value}'")
+        if t == "DATE":
+            try:
+                datetime.date.fromisoformat(value)
+            except ValueError:
+                raise RuntimeError(f"{f['name']} takes a date as YYYY-MM-DD, not '{value}'")
+            return f["id"], {"date": value}, value
+        if t == "ITERATION":
+            its = ((f.get("configuration") or {}).get("iterations") or [])
+            if value.lower() in ("@current", "current"):
+                today = datetime.date.today()
+                it = next((i for i in its if datetime.date.fromisoformat(i["startDate"]) <= today <
+                           datetime.date.fromisoformat(i["startDate"]) + datetime.timedelta(days=int(i["duration"]))),
+                          None)
+            else:
+                it = next((i for i in its if i["title"].lower() == value.lower()), None)
+            if not it:
+                raise RuntimeError(f"No {f['name']} '{value}' (open ones: {', '.join(i['title'] for i in its) or 'none'}"
+                                   "; @current is the one running today)")
+            return f["id"], {"iterationId": it["id"]}, it["title"]
+        return f["id"], {"text": value}, value
+
+    def set_fields(self, iss, resolved):
+        item = self.ensure_item(iss)
+        for field_id, val, _ in resolved:
+            if val is None:
+                gql("""mutation($p:ID!,$i:ID!,$f:ID!){ clearProjectV2ItemFieldValue(input:{projectId:$p, itemId:$i,
+                         fieldId:$f}){ projectV2Item{ id } } }""", {"p": self.data["id"], "i": item, "f": field_id})
+            else:
+                gql("""mutation($p:ID!,$i:ID!,$f:ID!,$v:ProjectV2FieldValue!){ updateProjectV2ItemFieldValue(input:{
+                         projectId:$p, itemId:$i, fieldId:$f, value:$v }){ projectV2Item{ id } } }""",
+                    {"p": self.data["id"], "i": item, "f": field_id, "v": val})
+
+    # --- issues
+    def issue(self, number):
+        d = gql("""query($o:String!,$r:String!,$n:Int!){ repository(owner:$o,name:$r){ issue(number:$n){
+                     id number title state url body createdAt parent{ number repository{ nameWithOwner } }
+                     assignees(first:10){ nodes{ login } } labels(first:30){ nodes{ name } }
+                     projectItems(first:20){ nodes{ id project{ id number }
+                       %s } } } } }""" % FIELD_VALUES,
+                {"o": self.repo_owner, "r": self.repo_name, "n": int(number)})
+        iss = ((d.get("repository") or {}).get("issue"))
+        if not iss:
+            raise RuntimeError(f"Issue #{number} not found in {self.repo}")
+        proj = self.data or self.load()
+        item = next((i for i in iss["projectItems"]["nodes"] if i["project"]["id"] == proj["id"]), None)
+        values = field_values(item["fieldValues"]["nodes"]) if item else {}
+        return {
+            "number": iss["number"], "title": iss["title"], "state": iss["state"], "url": iss["url"],
+            "node_id": iss["id"], "created": iss["createdAt"],
+            "assignees": [a["login"] for a in iss["assignees"]["nodes"]],
+            "labels": [l["name"] for l in iss["labels"]["nodes"]],
+            "item_id": item["id"] if item else None,
+            "status": values.get("Status"), "priority": values.get("Priority"),
+            "fields": {k: v for k, v in values.items() if k not in HAAM_FIELDS},
+            "parent": self._parent(iss.get("parent")),
+        }
+
+    def _parent(self, p):
+        """Parent epic number, only when the epic lives in this project's repository."""
+        if not p or (p.get("repository") or {}).get("nameWithOwner", self.repo).lower() != self.repo.lower():
+            return None
+        return p["number"]
+
+    def ensure_item(self, iss):
+        if iss.get("item_id"):
+            return iss["item_id"]
+        proj = self.data or self.load()
+        try:
+            d = gql("mutation($p:ID!,$c:ID!){ addProjectV2ItemById(input:{projectId:$p, contentId:$c}){ item{ id } } }",
+                    {"p": proj["id"], "c": iss["node_id"]})
+            iss["item_id"] = d["addProjectV2ItemById"]["item"]["id"]
+            return iss["item_id"]
+        except RuntimeError as e:
+            if "already exists" not in str(e).lower():
+                raise
+        # The board's own "Auto-add to project" workflow got there first: use its card (it can take a moment to show).
+        for attempt in range(6):
+            found = self.issue(iss["number"]).get("item_id")
+            if found:
+                iss["item_id"] = found
+                return found
+            time.sleep(min(poll_seconds(), 2.0))
+        raise RuntimeError(f"#{iss['number']} is on the board already, but its card couldn't be read yet. "
+                           "Set its fields again in a moment (issue status / priority).")
+
+    def set_option(self, iss, field_name, option):
+        field_id, opt_id = self.option_id(field_name, option)
+        item = self.ensure_item(iss)
+        gql("""mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){ updateProjectV2ItemFieldValue(input:{
+                 projectId:$p, itemId:$i, fieldId:$f, value:{ singleSelectOptionId:$o } }){ projectV2Item{ id } } }""",
+            {"p": self.data["id"], "i": item, "f": field_id, "o": opt_id})
+
+    def link(self, parent, child):
+        """Make `child` a sub-issue of the epic `parent` (both are dicts from issue())."""
+        gql("""mutation($p:ID!,$c:ID!){ addSubIssue(input:{issueId:$p, subIssueId:$c, replaceParent:true}){
+                 issue{ number } subIssue{ number } } }""", {"p": parent["node_id"], "c": child["node_id"]})
+
+    def unlink(self, parent_node_id, child):
+        gql("""mutation($p:ID!,$c:ID!){ removeSubIssue(input:{issueId:$p, subIssueId:$c}){ issue{ number } } }""",
+            {"p": parent_node_id, "c": child["node_id"]})
+
+    def sub_issues(self, number):
+        """All sub-issues of an epic, straight from GitHub (including ones not on the board)."""
+        d = gql("""query($o:String!,$r:String!,$n:Int!){ repository(owner:$o,name:$r){ issue(number:$n){
+                     id subIssues(first:100){ nodes{ number title state repository{ nameWithOwner } } } } } }""",
+                {"o": self.repo_owner, "r": self.repo_name, "n": int(number)})
+        iss = (d.get("repository") or {}).get("issue") or {}
+        return iss.get("id"), [k for k in (iss.get("subIssues") or {}).get("nodes") or []
+                               if k["repository"]["nameWithOwner"].lower() == self.repo.lower()]
+
+    def items(self):
+        proj = self.data or self.load()
+        out, after = [], None
+        while True:
+            d = gql("""query($p:ID!,$a:String){ node(id:$p){ ... on ProjectV2 { items(first:100, after:$a){
+                         pageInfo{ hasNextPage endCursor }
+                         nodes{ id content{ __typename ... on Issue { number title state url createdAt parent{ number repository{ nameWithOwner } }
+                           repository{ nameWithOwner } assignees(first:10){ nodes{ login } } labels(first:30){ nodes{ name } } } }
+                           %s } } } } }""" % FIELD_VALUES,
+                    {"p": proj["id"], "a": after})
+            page = d["node"]["items"]
+            for n in page["nodes"]:
+                c = n.get("content") or {}
+                if c.get("__typename") != "Issue":
+                    continue
+                vals = field_values(n["fieldValues"]["nodes"])
+                out.append({"number": c["number"], "title": c["title"], "state": c["state"], "url": c["url"],
+                            "repo": c["repository"]["nameWithOwner"], "created": c["createdAt"],
+                            "assignees": [a["login"] for a in c["assignees"]["nodes"]],
+                            "labels": [l["name"] for l in c["labels"]["nodes"]],
+                            "status": vals.get("Status"), "priority": vals.get("Priority"),
+                            "fields": {k: v for k, v in vals.items() if k not in HAAM_FIELDS},
+                            "parent": self._parent(c.get("parent"))})
+            if not page["pageInfo"]["hasNextPage"]:
+                return out
+            after = page["pageInfo"]["endCursor"]
+
+
+def board_field_name(board, field_id):
+    return next((f["name"] for f in board.data["fields"]["nodes"] if f.get("id") == field_id), field_id)
+
+
+def gh_login():
+    code, out, _ = run(["gh", "api", "user", "--jq", ".login"])
+    return out.strip() if code == 0 else ""
+
+
+def options_input(spec):
+    return [{"name": n, "color": col, "description": desc} for n, col, desc in spec]
+
+
+def cmd_github_project(args):
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    rep = Report()
+    rep.section("GitHub Projects board")
+    if cfg.get("tracker") != "github":
+        rep.add("warn", f"tracker is '{cfg.get('tracker')}' in {CONFIG_NAME}",
+                "set it first: python3 tools/haam/haam.py config --tracker github")
+    if not gh_ready(rep, cfg):
+        rep.print(args.json)
+        return
+    apply = args.apply
+    title = cfg.get("product_name") or cfg["github_repo"].split("/")[1]
+    try:
+        board = GHProject(cfg)
+        # Find or create the board
+        if board.number:
+            proj = board.load()
+            rep.add("ok", f"Board #{proj['number']} '{proj['title']}'", proj["url"])
+        else:
+            d = gql("query($o:String!){ repositoryOwner(login:$o){ id __typename ... on ProjectV2Owner {"
+                    " projectsV2(first:100){ nodes{ number title url } } } } }", {"o": board.owner})
+            owner = d.get("repositoryOwner")
+            if not owner:
+                raise RuntimeError(f"GitHub account '{board.owner}' not found")
+            match = next((p for p in owner["projectsV2"]["nodes"] if p["title"] == title), None)
+            if match:
+                board.number = match["number"]
+                rep.add("ok", f"Found board #{match['number']} '{title}'", match["url"])
+            elif apply:
+                rid = gql("query($o:String!,$r:String!){ repository(owner:$o,name:$r){ id } }",
+                          {"o": board.repo_owner, "r": board.repo_name})["repository"]["id"]
+                created = gql("mutation($o:ID!,$t:String!,$r:ID!){ createProjectV2(input:{ownerId:$o, title:$t,"
+                              " repositoryId:$r}){ projectV2{ number url } } }",
+                              {"o": owner["id"], "t": title, "r": rid})["createProjectV2"]["projectV2"]
+                board.number = created["number"]
+                rep.add("ok", f"Board #{created['number']} '{title}' created and linked to {cfg['github_repo']}", created["url"])
+            else:
+                rep.add("warn", f"No board called '{title}' for {board.owner}", "will create it and link the repo")
+            if board.number and apply:
+                cfg["github_project_number"] = board.number
+                cfg["github_project_owner"] = board.owner
+                save_config(root, cfg)
+            if board.number:
+                board.load()
+
+        if board.data:
+            proj = board.data
+            # Link repo (idempotent; errors if already linked are fine)
+            if apply:
+                try:
+                    rid = gql("query($o:String!,$r:String!){ repository(owner:$o,name:$r){ id } }",
+                              {"o": board.repo_owner, "r": board.repo_name})["repository"]["id"]
+                    gql("mutation($p:ID!,$r:ID!){ linkProjectV2ToRepository(input:{projectId:$p, repositoryId:$r}){"
+                        " repository{ id } } }", {"p": proj["id"], "r": rid})
+                except RuntimeError:
+                    pass
+
+            rep.section("Status field (12 statuses)")
+            status = board.field("Status")
+            want = [n for n, _, _ in GH_STATUSES]
+            have_opts = [o["name"] for o in (status or {}).get("options") or []]
+            if have_opts == want:
+                rep.add("ok", "Status has the 12 HAAM statuses")
+            elif not status:
+                rep.add("fail", "The board has no Status field", "add a single-select field called Status in the browser")
+            elif proj["items"]["totalCount"] and not args.force_status:
+                rep.add("warn", "Status options differ and the board already has items",
+                        "replacing options clears existing statuses; rerun with --force-status, or edit options in the browser")
+            elif apply:
+                gql("mutation($f:ID!,$o:[ProjectV2SingleSelectFieldOptionInput!]!){ updateProjectV2Field(input:{"
+                    " fieldId:$f, singleSelectOptions:$o }){ projectV2Field{ ... on ProjectV2FieldCommon { id } } } }",
+                    {"f": status["id"], "o": options_input(GH_STATUSES)})
+                rep.add("ok", "Status options set: " + ", ".join(want))
+            else:
+                rep.add("warn", "Status options", "will set: " + ", ".join(want))
+
+            rep.section("Priority field")
+            prio = board.field("Priority")
+            if prio:
+                rep.add("ok", "Priority field exists", ", ".join(o["name"] for o in prio.get("options") or []))
+            elif apply:
+                gql("mutation($p:ID!,$o:[ProjectV2SingleSelectFieldOptionInput!]!){ createProjectV2Field(input:{"
+                    " projectId:$p, name:\"Priority\", dataType:SINGLE_SELECT, singleSelectOptions:$o }){"
+                    " projectV2Field{ ... on ProjectV2FieldCommon { id } } } }",
+                    {"p": proj["id"], "o": options_input(GH_PRIORITIES)})
+                rep.add("ok", "Priority field created: Urgent, High, Medium, Low")
+            else:
+                rep.add("warn", "Priority field missing", "will create: Urgent, High, Medium, Low")
+
+            # Built-in workflows (browser only). "Item closed → Done" fights Canceled: ship sets Done itself.
+            rep.section("Board workflows")
+            rep.add("warn", 'Turn off the built-in "Item closed → Status: Done" workflow',
+                    "it overwrites Canceled after `issue status … Canceled` closes the issue. "
+                    "`ship` sets Done itself. Board → … → Workflows → Item closed → off. "
+                    "Keep Auto-add to project on for this repository.")
+            rep.action(WHO_BROWSER, "Board → … → Workflows: turn Item closed off; leave Auto-add on")
+    except RuntimeError as e:
+        rep.add("fail", "GitHub Projects error", str(e))
+        if "gh auth refresh" in str(e):
+            rep.action(WHO_TERMINAL, "Give your GitHub login access to Projects", "gh auth refresh -s project")
+        rep.print(args.json)
+        return
+
+    rep.section("Issue labels")
+    code, out, _ = run(["gh", "label", "list", "-R", cfg["github_repo"], "--json", "name", "-L", "200"])
+    existing = {l["name"] for l in json.loads(out)} if code == 0 and out else set()
+    for name, color, desc in GH_ISSUE_LABELS:
+        if name in existing:
+            rep.add("ok", name)
+        elif apply:
+            c2, _, e2 = run(["gh", "label", "create", name, "--color", color, "--description", desc, "-R", cfg["github_repo"]])
+            rep.add("ok" if c2 == 0 else "fail", f"{name} created" if c2 == 0 else name, e2[:120])
+        else:
+            rep.add("warn", f"{name} missing", "will create")
+
+    rep.section("Automation token (moves cards when PRs open and merge)")
+    code, out, _ = run(["gh", "secret", "list", "-R", cfg["github_repo"], "--json", "name"])
+    if code == 0 and PROJECT_TOKEN_SECRET in out:
+        rep.add("ok", f"{PROJECT_TOKEN_SECRET} secret present")
+    else:
+        rep.add("warn", f"{PROJECT_TOKEN_SECRET} secret missing", "cards won't move automatically on PR open/merge")
+        rep.action(WHO_TERMINAL,
+                   "Create a classic GitHub token with the 'project' scope (and 'repo' if the repository is private) at "
+                   "github.com/settings/tokens, then paste it when this command asks",
+                   f"gh secret set {PROJECT_TOKEN_SECRET} -R {cfg['github_repo']}")
+
+    rep.section("Board views (browser only)")
+    for v in ["Board: layout Board, group by Status",
+              "Triage: filter  status:Triage  (the product owner's daily inbox)",
+              "Epics: filter  label:epic  (table layout; show the Sub-issues progress field)",
+              "In table views, show the Parent issue field so each card shows its epic",
+              "Workflows: turn on 'Auto-add to project' for this repository (issues made on GitHub's website join the board, no Actions minutes)",
+              "Agent queue: filter  status:Ready no:assignee  (features also need label:agent-ready)",
+              "Waiting on me: filter  status:Decision,UAT",
+              "Ideas inbox: filter  status:Triage,Discovery label:stream:idea",
+              "Bugs: filter  label:stream:bug -status:Done,Canceled  sorted by Priority"]:
+        rep.add("info", v)
+    if board.data:
+        rep.action(WHO_BROWSER, "Create the saved views listed above on the board", board.data["url"])
+    rep.add("info", "Agents use `python3 tools/haam/haam.py issue ...` for this board (docs/process/TRACKER.md)")
+    if not apply:
+        rep.add("info", "Plan only. Re-run with --apply to make these changes")
+    rep.print(args.json)
+
+
+def parse_issue_number(text):
+    m = re.fullmatch(r"#?(\d+)", str(text).strip())
+    if not m:
+        sys.exit(f"Expected an issue number like 123 or #123, got '{text}'")
+    return int(m.group(1))
+
+
+def linked_issue_numbers(pr):
+    """Issues a PR refers to: 'Refs/Closes/Fixes #N' in title or body, or a branch named 'N-...'."""
+    nums = set()
+    for text in (pr.get("title") or "", pr.get("body") or ""):
+        for m in re.finditer(r"(?i)\b(?:refs?|closes?|closed|fix(?:es|ed)?|resolves?|resolved)\s*:?\s+#(\d+)", text):
+            nums.add(int(m.group(1)))
+        m = re.match(r"\s*#(\d+)\s*:", text)
+        if m:
+            nums.add(int(m.group(1)))
+    m = re.match(r"(\d+)-", pr.get("headRefName") or "")
+    if m:
+        nums.add(int(m.group(1)))
+    return sorted(nums)
+
+
+def cmd_issue(args):
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    if cfg.get("tracker") != "github":
+        sys.exit("This project tracks work in Linear: use the Linear connection (MCP). See docs/process/TRACKER.md.")
+    try:
+        board = GHProject(cfg)
+        board.load()
+        result = issue_action(args, cfg, board)
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}))
+        else:
+            print(f"✘ {e}", file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        print(json.dumps({"ok": True, **result}, indent=2))
+    elif result.get("message"):
+        print(result["message"])
+
+
+def issue_comments(repo, number):
+    """The issue's comments, oldest first: [{body, createdAt}]."""
+    code, out, _ = run(["gh", "issue", "view", str(number), "-R", repo, "--json", "comments"])
+    return (json.loads(out).get("comments") or []) if code == 0 and out else []
+
+
+def active_claims(comments):
+    """Claim comments since the last release, oldest first."""
+    last = max((k for k, c in enumerate(comments) if (c.get("body") or "").startswith(RELEASE_MARK)), default=-1)
+    return [c for c in comments[last + 1:] if (c.get("body") or "").startswith(CLAIM_MARK)]
+
+
+def claim_token(body):
+    m = re.search(r"· claim ([0-9a-f]{6,})", body or "")
+    return m.group(1) if m else ""
+
+
+def claim_branch(body):
+    m = re.search(r"branch `([^`]+)`", body or "")
+    return m.group(1) if m else ""
+
+
+def is_claimed(iss):
+    """A chat is working on it: building (In Progress), or assessing / writing its spec (label 'claimed')."""
+    return iss["status"] == "In Progress" or CLAIMED_LABEL in (iss["labels"] or [])
+
+
+def claim_is_mine(repo, number, args, comments=None):
+    """This chat holds the issue's claim: it gives the claim's id (--claim), or it's on the claim's branch."""
+    claims = active_claims(comments if comments is not None else issue_comments(repo, number))
+    if getattr(args, "claim", None) and args.claim in {claim_token(c.get("body")) for c in claims}:
+        return True
+    branch = git_out(Path.cwd(), "branch", "--show-current")
+    if not branch:
+        return False
+    return bool(re.match(rf"^{number}-", branch)) or any(claim_branch(c.get("body")) == branch for c in claims)
+
+
+def parse_when(t):
+    try:
+        return datetime.datetime.fromisoformat((t or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+STALE_CLAIM_LIST_DAYS = 3       # `issue stale` lists claims this quiet when stale_claim_days is 0 (as /triage stale)
+
+
+def origin_branch_times(root):
+    """{branch: time of its newest commit} for every branch on origin (as last fetched)."""
+    out = {}
+    for line in git_out(root, "for-each-ref", "--format=%(refname) %(committerdate:iso-strict)",
+                        "refs/remotes/origin/").splitlines():
+        ref, _, when = line.partition(" ")
+        name = ref[len("refs/remotes/origin/"):]
+        if name != "HEAD" and parse_when(when):
+            out[name] = parse_when(when)
+    return out
+
+
+def claim_activity(number, comments, tips):
+    """The last sign of life of an issue's claim: its newest comment, or the newest commit on a branch its claim
+    names, or one named <number>-… (or spike/<number>-…) on origin. Returns (when or None, [branches])."""
+    named = {claim_branch(c.get("body")) for c in active_claims(comments)}
+    branches = sorted(b for b in tips if b in named or re.match(rf"^(spike/)?{number}-", b))
+    times = [t for t in (parse_when(c.get("createdAt")) for c in comments) if t] + [tips[b] for b in branches]
+    return (max(times) if times else None), branches
+
+
+def quiet_days(when):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return (now - when).total_seconds() / 86400 if when else None
+
+
+def issue_action(args, cfg, board):
+    repo = cfg["github_repo"]
+    a = args.action
+
+    if a == "list":
+        items = [i for i in board.items() if i["repo"].lower() == repo.lower()]
+        if args.status:
+            wanted = {s.lower() for s in args.status}
+            items = [i for i in items if (i["status"] or "").lower() in wanted]
+        for lab in args.label or []:
+            items = [i for i in items if lab in i["labels"]]
+        for lab in args.no_label or []:
+            items = [i for i in items if lab not in i["labels"]]
+        if args.unassigned:
+            items = [i for i in items if not i["assignees"]]
+        if args.open_only:
+            items = [i for i in items if i["state"] == "OPEN"]
+        if args.parent:
+            pn = parse_issue_number(args.parent)
+            items = [i for i in items if i.get("parent") == pn]
+        if args.no_parent:
+            items = [i for i in items if not i.get("parent")]
+        for name, want in parse_field_args(args.field):
+            items = [i for i in items if str(next((v for k, v in (i.get("fields") or {}).items()
+                                                   if k.lower() == name.lower()), "")).lower() == want.lower()]
+        order = {n: k for k, (n, _, _) in enumerate(GH_PRIORITIES)}
+        items.sort(key=lambda i: (order.get(i["priority"], 9), i["created"]))
+        lines = [f"#{i['number']:<5} {i['status'] or '-':<12} {i['priority'] or '-':<7} "
+                 f"{','.join(i['assignees']) or '-':<14} {i['title']}  [{', '.join(i['labels'])}]"
+                 + (f"  (epic #{i['parent']})" if i.get("parent") else "") for i in items]
+        return {"items": items, "message": "\n".join(lines) or "No matching issues."}
+
+    if a == "stale":
+        limit = int(setting_value(cfg, "stale_claim_days") or 0)
+        days = args.days if args.days is not None else (limit or STALE_CLAIM_LIST_DAYS)
+        run(["git", "fetch", "--quiet", "--prune", "origin"], cwd=Path.cwd())
+        tips = origin_branch_times(Path.cwd())
+        found = []
+        for i in board.items():
+            if i["repo"].lower() != repo.lower() or i["state"] != "OPEN" or not is_claimed(i):
+                continue
+            when, branches = claim_activity(i["number"], issue_comments(repo, i["number"]), tips)
+            q = quiet_days(when)
+            if q is None or q >= days:
+                found.append({"number": i["number"], "title": i["title"], "status": i["status"],
+                              "labels": i["labels"], "quiet_days": None if q is None else round(q, 1),
+                              "last_activity": when.isoformat() if when else None, "branches": branches,
+                              "releasable": bool(limit) and q is not None and q >= limit})
+        found.sort(key=lambda x: -(x["quiet_days"] or 0))
+        lines = [f"#{x['number']:<5} {x['status'] or '-':<12} "
+                 + (f"quiet {x['quiet_days']:g} day(s)" if x["quiet_days"] is not None else "no activity found")
+                 + f"  {x['title']}" + (f"  (branch {', '.join(x['branches'])})" if x["branches"] else "")
+                 for x in found]
+        if not found:
+            msg = f"No claim has been quiet for {days:g} day(s) or more."
+        elif limit:
+            msg = ("\n".join(lines) + f"\nstale_claim_days is {limit}: release one quiet that long with "
+                   "`issue release <number> --stale`, then pick it up (continue on its branch).")
+        else:
+            msg = ("\n".join(lines) + "\nAgents don't release these here (stale_claim_days is 0): tell the owner. "
+                   "/triage stale frees them, or /haam-settings sets stale_claim_days so agents can.")
+        return {"days": days, "stale_claim_days": limit, "claims": found, "message": msg}
+
+    if a == "fields":
+        fl = board.custom_fields()
+        lines = [f"  {f['name']} ({f['type']})" + (f": {', '.join(f['options'])}" if f["options"] else "") for f in fl]
+        return {"fields": fl, "message": ("The board's own fields (set with --field NAME=VALUE):\n" + "\n".join(lines))
+                if fl else "The board has no fields of its own besides Status and Priority."}
+
+    if a == "create":
+        if not args.title:
+            sys.exit("--title is required")
+        body = Path(args.body_file).read_text() if args.body_file else (args.body or "")
+        labels = [f"stream:{args.stream}"] + (args.label or []) + ([EPIC_LABEL] if args.epic else [])
+        for lab in labels:
+            if lab in HUMAN_LABELS and not args.human:
+                raise RuntimeError(f"{HUMAN_LABELS[lab]}; add --human only when they decided it in this session")
+        parent = None
+        if args.parent and args.epic:
+            raise RuntimeError("Epics don't nest in HAAM: an epic can't have a parent epic")
+        if args.parent:
+            parent = board.issue(parse_issue_number(args.parent))
+            if EPIC_LABEL not in parent["labels"]:
+                raise RuntimeError(f"#{parent['number']} isn't an epic (label '{EPIC_LABEL}'). Make it one first: "
+                                   f"issue label {parent['number']} --add {EPIC_LABEL}")
+        fields = [board.resolve_field(n, v) for n, v in parse_field_args(args.field)]    # checked before creating
+        need = required_fields_for(cfg, epic=bool(args.epic))
+        if need:
+            have = {board_field_name(board, fid).lower() for fid, _, _ in fields}
+            missing = [n for n in need if n.lower() not in have]
+            if missing:
+                raise RuntimeError(
+                    f"This project requires these board fields on every {'epic' if args.epic else 'issue'}: "
+                    + ", ".join(need) + f". Missing: {', '.join(missing)}. "
+                    + "Add --field NAME=VALUE (pick the closest option; `issue fields` lists them). "
+                    + "Change the list with config --required-fields … --human.")
+        cmd = ["gh", "issue", "create", "-R", repo, "--title", args.title, "--body", body]
+        for lab in labels:
+            cmd += ["--label", lab]
+        code, out, err = run(cmd)
+        if code != 0:
+            raise RuntimeError(err or out)
+        number = int(out.strip().rstrip("/").split("/")[-1])
+        iss = board.issue(number)
+        status = args.status[-1] if args.status else ("Backlog" if args.stream == "feature" else "Triage")
+        board.set_option(iss, "Status", status)
+        if args.priority:
+            board.set_option(iss, "Priority", args.priority)
+        if fields:
+            board.set_fields(iss, fields)
+        if parent:
+            board.link(parent, iss)
+        shown = "".join(f", {board_field_name(board, fid)}={disp}" for fid, _, disp in fields if disp)
+        return {"number": number, "url": iss["url"], "status": status, "parent": parent["number"] if parent else None,
+                "fields": {board_field_name(board, fid): disp for fid, _, disp in fields},
+                "message": f"Created {'epic ' if args.epic else ''}#{number} ({status}"
+                           f"{', ' + args.priority if args.priority else ''}{shown}"
+                           f"{', in epic #' + str(parent['number']) if parent else ''}): {iss['url']}"}
+
+    number = parse_issue_number(args.number) if args.number else None
+    if number is None:
+        sys.exit(f"`issue {a}` needs an issue number")
+    iss = board.issue(number)
+
+    if a == "view":
+        msg = (f"#{iss['number']} {iss['title']}\n  state: {iss['state']} · status: {iss['status'] or '-'} · "
+               f"priority: {iss['priority'] or '-'} · assignees: {', '.join(iss['assignees']) or '-'}\n"
+               f"  labels: {', '.join(iss['labels']) or '-'}"
+               + (f" · epic: #{iss['parent']}" if iss.get("parent") else "")
+               + ("\n  " + " · ".join(f"{k}: {v}" for k, v in iss["fields"].items()) if iss.get("fields") else "")
+               + f"\n  {iss['url']}")
+        return {"issue": {k: v for k, v in iss.items() if k != "node_id"}, "message": msg}
+
+    if a == "link":
+        if not args.parent:
+            sys.exit("Give the epic: `issue link 14 --parent 9`")
+        epic = board.issue(parse_issue_number(args.parent))
+        if EPIC_LABEL not in epic["labels"]:
+            raise RuntimeError(f"#{epic['number']} isn't an epic (label '{EPIC_LABEL}')")
+        if EPIC_LABEL in iss["labels"]:
+            raise RuntimeError(f"#{number} is itself an epic; epics don't nest in HAAM")
+        board.ensure_item(iss)
+        board.link(epic, iss)
+        return {"number": number, "parent": epic["number"], "message": f"#{number} is now part of epic #{epic['number']}"}
+
+    if a == "children":
+        _, subs = board.sub_issues(number)
+        on_board = {i["number"]: i for i in board.items() if i["repo"].lower() == repo.lower()}
+        kids = [on_board.get(k["number"]) or {"number": k["number"], "title": k["title"], "state": k["state"],
+                                               "status": None, "priority": None, "created": "", "not_on_board": True}
+                for k in subs]
+        order = {n: k for k, (n, _, _) in enumerate(GH_PRIORITIES)}
+        kids.sort(key=lambda i: (order.get(i["priority"], 9), i["created"]))
+        done = len([k for k in kids if k["status"] in ("Done", "Canceled") or k["state"] == "CLOSED"])
+        lines = [f"Epic #{number} {iss['title']}: {done}/{len(kids)} done"] + [
+            f"  #{k['number']:<5} {k['status'] or '-':<12} {k['priority'] or '-':<7} {k['title']}"
+            + ("  (not on the board: issue add " + str(k["number"]) + ")" if k.get("not_on_board") else "") for k in kids]
+        return {"epic": number, "children": kids, "done": done, "message": "\n".join(lines)}
+
+    if a == "unlink":
+        if not iss.get("parent"):
+            return {"number": number, "message": f"#{number} isn't in an epic"}
+        epic_id, _ = board.sub_issues(iss["parent"])
+        board.unlink(epic_id, iss)
+        return {"number": number, "message": f"#{number} is no longer part of epic #{iss['parent']}"}
+
+    if a == "edit":
+        if not (args.title or args.body or args.body_file or args.field):
+            sys.exit("Give --title, --body / --body-file and/or --field NAME=VALUE")
+        fields = [board.resolve_field(n, v) for n, v in parse_field_args(args.field)]
+        if args.title or args.body or args.body_file:
+            cmd = ["gh", "issue", "edit", str(number), "-R", repo]
+            if args.title:
+                cmd += ["--title", args.title]
+            if args.body or args.body_file:
+                cmd += ["--body", Path(args.body_file).read_text() if args.body_file else args.body]
+            code, out, err = run(cmd)
+            if code != 0:
+                raise RuntimeError(err or out)
+        if fields:
+            board.set_fields(iss, fields)
+        shown = ", ".join(f"{board_field_name(board, fid)}={disp or '(cleared)'}" for fid, _, disp in fields)
+        return {"number": number, "message": f"#{number} updated" + (f": {shown}" if shown else "")}
+
+    if a == "add":
+        board.ensure_item(iss)
+        if not iss["status"]:
+            board.set_option(iss, "Status", "Triage")
+        return {"number": number, "message": f"#{number} is on the board ({iss['status'] or 'Triage'})"}
+
+    if a == "status":
+        new = args.value
+        if not new:
+            sys.exit("Give the new status, e.g. `issue status 12 \"In Progress\"`")
+        canon = next((n for n, _, _ in GH_STATUSES if n.lower() == new.lower()), None)
+        if not canon:
+            raise RuntimeError(f"Unknown status '{new}'. Valid: {', '.join(n for n, _, _ in GH_STATUSES)}")
+        guarded = is_claimed(iss) and not (args.force or args.human)
+        # This chat's own claim: its id (--claim), or its branch (a batch PR's branch is named after its first issue;
+        # the claim comment names the branch).
+        if guarded and not claim_is_mine(repo, number, args):
+            raise RuntimeError(f"#{number} is claimed (status {iss['status']}, assigned to {', '.join(iss['assignees']) or '-'}) "
+                               "and this chat isn't on its branch. Leave it to the chat working on it, or add --force "
+                               "only when the human asked (e.g. /triage releasing a stuck claim).")
+        human_move = canon in HUMAN_STATUSES or (iss["status"] == "Decision" and canon == "Backlog")
+        if human_move and not args.human:
+            raise RuntimeError(f"Moving to {canon} is a human decision. Only do it while running the human-only skill "
+                               "the human typed (/triage, /epic, /decide, /release …), and add --human.")
+        board.set_option(iss, "Status", canon)
+        msg = f"#{number}: {iss['status'] or '-'} → {canon}"
+        rework = None
+        if canon == "UAT" and UAT_FAILED_LABEL in (iss["labels"] or []):
+            # Rework handed over again: the label means "send back to the agents", so it goes now (anything reading
+            # it would treat a ticket waiting for its test as not fixed yet); the hand-over comment says the round.
+            code, out, err = run(["gh", "issue", "edit", str(number), "-R", repo, "--remove-label", UAT_FAILED_LABEL])
+            if code != 0:
+                raise RuntimeError(err or out)
+            fails = sum(FAILED_MARK in (c.get("body") or "") for c in issue_comments(repo, number))
+            rework = max(fails, 1)
+            msg += (f" · rework, round {rework}: removed {UAT_FAILED_LABEL}. Start the hand-over comment with "
+                    f"`{REWORK_MARK} {rework}`.")
+        if canon == "Canceled" and iss["state"] == "OPEN":
+            code, out, err = run(["gh", "issue", "close", str(number), "-R", repo, "--reason", "not planned"])
+            if code != 0:
+                raise RuntimeError(err or out)
+            msg += " (closed as not planned)"
+            # GitHub's built-in board workflow "Item closed → Status: Done" (on by default) runs after
+            # the close and can overwrite Canceled. Wait briefly, then set Canceled again so it sticks.
+            settle = min(poll_seconds(), 2.0)
+            if settle:
+                time.sleep(settle)
+            board.set_option(iss, "Status", "Canceled")
+            msg += "; Canceled re-applied after close"
+        return {"number": number, "status": canon, "message": msg, **({"rework_round": rework} if rework else {})}
+
+    if a == "priority":
+        if not args.value:
+            sys.exit("Give the priority: Urgent, High, Medium or Low")
+        board.set_option(iss, "Priority", args.value)
+        return {"number": number, "priority": args.value, "message": f"#{number}: priority {args.value}"}
+
+    if a == "label":
+        cmd = ["gh", "issue", "edit", str(number), "-R", repo]
+        for lab in args.add or []:
+            if lab in HUMAN_LABELS and not args.human:
+                raise RuntimeError(f"{HUMAN_LABELS[lab]}; add --human only when they decided it in this session")
+            cmd += ["--add-label", lab]
+        for lab in args.remove or []:
+            if lab == OWNER_TEST_LABEL and not args.human:
+                raise RuntimeError("Only the owner removes owner-test (their own test). Add --human only when they "
+                                   "said so in this session.")
+            cmd += ["--remove-label", lab]
+        pull_back = OWNER_TEST_LABEL in (args.add or []) and OWNER_TEST_LABEL not in iss["labels"]
+        if pull_back and "verifying" in iss["labels"]:
+            cmd += ["--remove-label", "verifying"]
+        code, out, err = run(cmd)
+        if code != 0 and any(x in LANE_LABEL_NAMES for x in args.add or []) and "not found" in (err or out or "").lower():
+            ensure_labels(repo, [x for x in args.add if x in LANE_LABEL_NAMES])
+            code, out, err = run(cmd)
+        if code != 0:
+            raise RuntimeError(err or out)
+        msg = f"#{number}: labels updated"
+        if pull_back:
+            msg += pull_back_to_owner(cfg, board, iss)
+        return {"number": number, "message": msg}
+
+    if a == "comment":
+        body = Path(args.body_file).read_text() if args.body_file else (args.body or "")
+        if not body:
+            sys.exit("--body or --body-file is required")
+        code, out, err = run(["gh", "issue", "comment", str(number), "-R", repo, "--body", body])
+        if code != 0:
+            raise RuntimeError(err or out)
+        return {"number": number, "message": f"Commented on #{number}"}
+
+    if a == "claim":
+        me = gh_login()
+        phase = args.for_ or "build"
+        if iss["state"] != "OPEN":
+            raise RuntimeError(f"#{number} is closed")
+        others = [x for x in iss["assignees"] if x != me]
+        if is_claimed(iss) or others:
+            who = ", ".join(iss["assignees"]) or "-"
+            raise RuntimeError(f"#{number} is already claimed (status {iss['status']}, assignees {who}"
+                               + (", being assessed or specced by another chat" if CLAIMED_LABEL in iss["labels"] else "")
+                               + "). Pick another issue.")
+        if "human-only" in iss["labels"]:
+            raise RuntimeError(f"#{number} is labelled human-only")
+        bug = "stream:bug" in iss["labels"]
+        if phase == "build":
+            if iss["status"] not in ("Ready", None) and not args.force:
+                raise RuntimeError(f"#{number} is in {iss['status']}, not Ready. Only Ready issues are built (AGENTS.md §3).")
+            if EPIC_LABEL in iss["labels"]:
+                raise RuntimeError(f"#{number} is an epic: build its sub-issues instead (issue children {number})")
+        elif phase == "assess":
+            if iss["status"] not in ("Triage", "Discovery", None):
+                raise RuntimeError(f"#{number} is in {iss['status']}: only ideas in Triage or Discovery are assessed.")
+        elif phase == "spike":
+            if iss["status"] not in ("Triage", "Discovery", "Decision", "Backlog", None):
+                raise RuntimeError(f"#{number} is in {iss['status']}: prototypes are built for ideas (Triage to "
+                                   "Decision) and Backlog features, before their spec.")
+        elif phase == "spec":
+            if not (iss["status"] == "Backlog" or (bug and iss["status"] in ("Triage", "Ready"))):
+                raise RuntimeError(f"#{number} is in {iss['status']}: specs are written for Backlog features "
+                                   "(or bugs that need a fix plan).")
+            if EPIC_LABEL in iss["labels"]:
+                raise RuntimeError(f"#{number} is an epic: write a spec for each of its sub-issues instead")
+        elif phase == "verify":
+            why = verify_claim_refusal(cfg, iss)
+            if why:
+                raise RuntimeError(why)
+        token = os.urandom(3).hex()
+        cmd = ["gh", "issue", "edit", str(number), "-R", repo, "--add-assignee", "@me"]
+        if phase != "build":
+            cmd += ["--add-label", CLAIMED_LABEL]
+        code, out, err = run(cmd)
+        if code != 0 and phase != "build" and "not found" in (err or out or "").lower():
+            lab = next(x for x in GH_ISSUE_LABELS if x[0] == CLAIMED_LABEL)
+            run(["gh", "label", "create", lab[0], "-R", repo, "--color", lab[1], "--description", lab[2], "--force"])
+            code, out, err = run(cmd)
+        if code != 0:
+            raise RuntimeError(err or out)
+        if phase == "build":
+            board.set_option(iss, "Status", "In Progress")
+        elif phase in ("assess", "spike") and iss["status"] in ("Triage", None):
+            board.set_option(iss, "Status", "Discovery")
+        tool = args.tool or "an agent"
+        where = f" on {args.machine}" if args.machine else ""
+        branch = args.branch or (f"{number}-<short-title>" if phase == "build" else "")
+        what = {"build": "", "assess": " to assess it", "spec": " to write its spec",
+                "spike": " to build a prototype", "verify": VERIFY_CLAIM_WHAT}[phase]
+        body = (f"{CLAIM_MARK} @{me} via {tool}{where}{what}" + (f" · branch `{branch}`" if branch else "")
+                + f" · claim {token}")
+        code, out, err = run(["gh", "issue", "comment", str(number), "-R", repo, "--body", body])
+        if code != 0:
+            raise RuntimeError(err or out)
+        # Two chats can claim in the same second (they run as the same GitHub user, so the assignee doesn't tell
+        # them apart). The first claim comment wins; a later one withdraws.
+        claims = active_claims(issue_comments(repo, number))
+        mine = next((c for c in claims if claim_token(c.get("body")) == token), None)
+        when = parse_when(mine.get("createdAt")) if mine else None
+        rivals = []
+        for c in claims:
+            if c is mine:
+                break
+            if phase == "verify" and VERIFY_CLAIM_WHAT not in (c.get("body") or ""):
+                continue                    # the build's own claim, still open in test-first: not a rival verifier
+            t = parse_when(c.get("createdAt"))
+            if not when or not t or (when - t).total_seconds() <= CLAIM_RACE_MINUTES * 60:
+                rivals.append(c)
+        if mine and rivals:
+            run(["gh", "issue", "comment", str(number), "-R", repo, "--body",
+                 f"↩️ Claim {token} withdrawn: another chat claimed #{number} first (claim "
+                 f"{claim_token(rivals[0].get('body')) or '?'})."])
+            raise RuntimeError(f"#{number} was claimed by another chat a moment earlier. Pick another issue.")
+        release = f"python3 tools/haam/haam.py issue release {number} --claim {token}"
+        nxt = {"build": f"Branch: git fetch origin && git switch -c {number}-<short-title> origin/main",
+               "assess": f"When the assessment is pushed: {release} --status Decision",
+               "spec": f"When the spec is pushed: {release}",
+               "spike": "Branch spike/<branch name>; when the prototype is pushed, label it spike-ready and "
+                        + (f"{release} --status Decision" if "stream:idea" in iss["labels"] else release),
+               "verify": f"Work detached at the handed-over head, in your own worktree, then record the verdict: "
+                         f"python3 tools/haam/haam.py verify-result {number} --verdict verified|not-verified|needs-owner "
+                         f"--head <sha> --claim {token} --body-file <card> (it releases the claim)"}[phase]
+        return {"number": number, "assignee": me, "claim": token, "phase": phase,
+                "message": f"Claimed #{number} for @{me}{what} (claim {token}). {nxt}"}
+
+    if a == "release":
+        comments = issue_comments(repo, number)
+        claims = active_claims(comments)
+        if not claims and not is_claimed(iss):
+            return {"number": number, "message": f"#{number} isn't claimed"}
+        stale_note = ""
+        if getattr(args, "stale", False) and not args.human and not claim_is_mine(repo, number, args, comments):
+            limit = int(setting_value(cfg, "stale_claim_days") or 0)
+            if limit <= 0:
+                raise RuntimeError("Releasing another chat's quiet claim is off here (stale_claim_days is 0). Tell "
+                                   "the owner: /triage stale frees it, or /haam-settings turns this on.")
+            if args.status:
+                raise RuntimeError("--stale releases the claim only; the status stays (In Progress goes back to Ready).")
+            run(["git", "fetch", "--quiet", "--prune", "origin"], cwd=Path.cwd())
+            when, branches = claim_activity(number, comments, origin_branch_times(Path.cwd()))
+            q = quiet_days(when)
+            if q is None or q < limit:
+                raise RuntimeError(f"#{number} isn't quiet long enough to release: last sign of life "
+                                   + (f"{q:.1f} day(s) ago" if q is not None else "unknown")
+                                   + f", stale_claim_days is {limit}. Pick another issue.")
+            stale_note = (f"quiet for {q:.0f} day(s) (stale_claim_days {limit}), so the chat that claimed it has "
+                          "stopped; the next chat picks it up"
+                          + (f" and continues on branch `{branches[0]}`" if branches else ""))
+        elif not (args.human or claim_is_mine(repo, number, args, comments)):
+            raise RuntimeError(f"#{number} is claimed by another chat. Give this chat's claim id (--claim, from your "
+                               "claim's output or comment), or --human when the human asked you to release it "
+                               "(e.g. /triage stale). A claim quiet for stale_claim_days: --stale.")
+        asked = (args.status or [None])[-1]
+        new = None
+        if asked:
+            new = next((n for n, _, _ in GH_STATUSES if n.lower() == asked.lower()), None)
+            if not new:
+                raise RuntimeError(f"Unknown status '{asked}'")
+            if (new in HUMAN_STATUSES or (iss["status"] == "Decision" and new == "Backlog")) and not args.human:
+                raise RuntimeError(f"Moving to {new} is a human decision: add --human only inside the human-only skill.")
+        elif iss["status"] == "In Progress":
+            new = "Ready"
+        cmd = ["gh", "issue", "edit", str(number), "-R", repo]
+        for x in iss["assignees"]:
+            cmd += ["--remove-assignee", x]
+        if CLAIMED_LABEL in iss["labels"]:
+            cmd += ["--remove-label", CLAIMED_LABEL]
+        if len(cmd) > 6:
+            code, out, err = run(cmd)
+            if code != 0:
+                raise RuntimeError(err or out)
+        if new and new != iss["status"]:
+            board.set_option(iss, "Status", new)
+        tokens = ", ".join(t for t in (claim_token(c.get("body")) for c in claims) if t)
+        why = "".join(f" · {x}" for x in (stale_note, args.body) if x)
+        run(["gh", "issue", "comment", str(number), "-R", repo, "--body",
+             f"{RELEASE_MARK}" + (f" ({tokens})" if tokens else "") + (f" · status {new}" if new else "") + why])
+        return {"number": number, "status": new or iss["status"],
+                "message": f"Released #{number}" + (f"; status {new}" if new else "")}
+
+    if a == "close":
+        if not args.human:
+            raise RuntimeError("Closing an issue is done by /release (human-only). Add --human when running it.")
+        board.set_option(iss, "Status", "Done")
+        code, out, err = run(["gh", "issue", "close", str(number), "-R", repo, "--reason", "completed"])
+        if code != 0:
+            raise RuntimeError(err or out)
+        return {"number": number, "message": f"#{number} Done and closed"}
+
+    raise RuntimeError(f"Unknown action '{a}'")
+
+
+# What a PR's open and merge may move: only work that's being delivered. A mere mention ("Refs #5" for context) of
+# something in Backlog, Ready or Decision, an epic (its status follows its slices: /build, /release), a docs-only PR
+# (an epic brief, a split spec) and a spike never move the board.
+SYNC_FROM = {"opened": {"In Progress"}, "merged": {"In Progress", "In Review", "UAT"}}
+
+
+def cmd_sync_pr(args):
+    """Used by the tracker-sync workflow: move linked issues when a PR opens or merges."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    if cfg.get("tracker") != "github":
+        print("tracker is not github; nothing to do")
+        return
+    code, out, err = run(["gh", "pr", "view", str(args.pr), "-R", cfg["github_repo"], "--json",
+                          "title,body,headRefName,isDraft,files"])
+    if code != 0:
+        sys.exit(f"Can't read PR #{args.pr}: {err}")
+    pr = json.loads(out)
+    if (pr.get("headRefName") or "").lower().startswith("spike/"):
+        print(f"PR #{args.pr} is a spike (a prototype): it never merges, so the board doesn't move")
+        return
+    if docs_only(pr.get("files")):
+        print(f"PR #{args.pr} changes only docs (a brief, a split spec, an assessment): the issues it mentions "
+              "stay where they are")
+        return
+    nums = linked_issue_numbers(pr)
+    if not nums:
+        print(f"PR #{args.pr} doesn't reference an issue (use 'Refs #123' in the description)")
+        return
+    board = GHProject(cfg)
+    board.load()
+    target = {"opened": "In Review", "merged": "Deploying"}[args.event]
+    for n in nums:
+        try:
+            iss = board.issue(n)
+        except RuntimeError as e:
+            print(f"#{n}: {e}")
+            continue
+        if args.event == "opened" and pr.get("isDraft"):
+            print(f"#{n}: PR is a draft; leaving status {iss['status']}")
+            continue
+        if EPIC_LABEL in iss["labels"]:
+            print(f"#{n}: an epic; its status follows its sub-issues, unchanged")
+            continue
+        if iss["status"] == target:
+            continue
+        if iss["status"] not in SYNC_FROM[args.event]:
+            print(f"#{n}: {iss['status'] or 'no status'}; unchanged (only work being delivered moves on "
+                  f"{args.event})")
+            continue
+        board.set_option(iss, "Status", target)
+        print(f"#{n}: {iss['status'] or '-'} → {target}")
+
+
+# ----------------------------------------------------------------------------- testing and shipping
+
+def poll_seconds():
+    try:
+        return float(os.environ.get("HAAM_POLL_SECONDS", "15"))
+    except ValueError:
+        return 15.0
+
+
+def issue_ref(cfg, text):
+    """The issue the human means: a number on GitHub Projects, an ID like APP-12 on Linear."""
+    t = (text or "").strip()
+    if cfg.get("tracker") == "github":
+        n = parse_issue_number(t)
+        if n is None:
+            sys.exit(f"Give the issue number, e.g. #12 (got '{text}')")
+        return n
+    if not re.fullmatch(r"[A-Za-z]{2,5}-\d+", t):
+        sys.exit(f"Give the Linear issue ID, e.g. {cfg['team_key']}-12 (got '{text}')")
+    return t.upper()
+
+
+def show_ref(ref):
+    return f"#{ref}" if isinstance(ref, int) else ref
+
+
+def file_id(ref):
+    return f"GH-{ref}" if isinstance(ref, int) else ref
+
+
+def pr_matches(pr, ref):
+    """Strict: the PR's branch or title names this issue (never a mere mention in the description)."""
+    head = (pr.get("headRefName") or "").lower()
+    if isinstance(ref, int):
+        return bool(re.match(rf"^{ref}-", head)) or ref in pr_title_issues(pr)
+    key = ref.lower()
+    return bool(re.search(rf"(^|/){re.escape(key)}-", head)) or ref in pr_title_issues(pr)
+
+
+def pr_title_issues(pr):
+    """Issues a PR's title names before the colon: '#12: …', or a batch '#12 #13 #14: …' ('APP-12 APP-13: …')."""
+    m = re.match(r"\s*((?:(?:#\d+|[A-Za-z]{2,5}-\d+)[\s,]*)+):", pr.get("title") or "")
+    if not m:
+        return []
+    out = []
+    for tok in re.findall(r"#\d+|[A-Za-z]{2,5}-\d+", m.group(1)):
+        out.append(int(tok[1:]) if tok.startswith("#") else tok.upper())
+    return out
+
+
+def find_pr(cfg, ref, states=("open", "merged")):
+    """The PR for an issue (branch `12-…` or title `#12: …`; Linear: `app-12-…` or `APP-12: …`).
+    Refuses to guess when more than one PR in the same state matches."""
+    for state in states:
+        code, out, err = run(["gh", "pr", "list", "-R", cfg["github_repo"], "--state", state, "--limit", "100",
+                              "--json", "number,title,headRefName,state,labels,url,isDraft"])
+        if code != 0:
+            raise RuntimeError(err or out)
+        prs = [p for p in json.loads(out or "[]") if pr_matches(p, ref)]
+        if len(prs) > 1:
+            raise RuntimeError(f"More than one {state} PR matches {show_ref(ref)}: "
+                               + ", ".join(f"#{p['number']}" for p in prs) + ". Close the extra one(s) first.")
+        if prs:
+            return prs[0]
+    return None
+
+
+def tested_file(root):
+    _, main, _ = git_paths(root)
+    return main / ".haam" / "tested.json"
+
+
+def remember_tested(root, ref, sha, branch=None):
+    f = tested_file(root)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    data = json.loads(f.read_text()) if f.exists() else {}
+    data[show_ref(ref)] = sha
+    if branch:
+        data.setdefault("branches", {})[show_ref(ref)] = branch
+    f.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def tested_sha(root, ref):
+    f = tested_file(root)
+    return (json.loads(f.read_text()) if f.exists() else {}).get(show_ref(ref))
+
+
+def tested_branch_of(root, ref):
+    f = tested_file(root)
+    return ((json.loads(f.read_text()) if f.exists() else {}).get("branches") or {}).get(show_ref(ref))
+
+
+def cmd_checkout_pr(args):
+    """Put the change for an issue on this machine, ready to test (detached, so agents' worktrees aren't disturbed)."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    if args.back:
+        b = default_base(root)
+        base = b.split("/", 1)[1] if b.startswith("origin/") else "main"
+        code, _, err = run(["git", "switch", base], cwd=root)
+        if code != 0:
+            sys.exit(f"Couldn't switch back to {base}: {err}")
+        print(f"{OK} Back on {base}. Stop the app if it's still running.")
+        return
+    if not args.issue:
+        sys.exit("Give the issue, e.g. checkout-pr 12")
+    ref = issue_ref(cfg, args.issue)
+    if git_out(root, "status", "--porcelain", "--untracked-files=no"):
+        sys.exit("You have unsaved changes in this folder. Commit them, or copy them somewhere safe and undo them, "
+                 "then try again. (Avoid git stash: all worktrees share one stash list, so agents' work gets mixed in.)")
+    try:
+        pr = None if args.branch else find_pr(cfg, ref, ("open",))
+    except RuntimeError as e:
+        sys.exit(f"Couldn't pick the pull request: {e}")
+    run(["git", "fetch", "--quiet", "--prune", "origin"], cwd=root)
+    note = ""
+    if pr:
+        branch, target = pr["headRefName"], f"origin/{pr['headRefName']}"
+    else:
+        # Test-first: no PR yet. Test the branch the agent pushed (its hand-over), or one that is only on this
+        # computer (worktrees share branches) if it hasn't pushed.
+        try:
+            branch, target, note = find_branch(root, cfg, ref, args.branch)
+        except RuntimeError as e:
+            sys.exit(str(e))
+        if not branch:
+            sys.exit(f"No pull request and no branch found for {show_ref(ref)} (looked for {branch_prefix(ref)}… and the "
+                     "branch named in its claim or UAT comment). If the agent used another branch, add --branch <name>.")
+    code, _, err = run(["git", "switch", "--quiet", "--detach", target], cwd=root)
+    if code != 0:
+        sys.exit(f"Couldn't check out {branch}: {err}")
+    sha = git_out(root, "rev-parse", "HEAD")
+    remember_tested(root, ref, sha, branch)
+    # A batch's plan is named after the issue its branch is named after.
+    plans = []
+    for r in dict.fromkeys(x for x in (ref, branch_issue(branch, ref)) if x is not None):
+        plans += [p.relative_to(root).as_posix() for p in sorted((root / "docs/uat").glob(f"{file_id(r)}-*.md"))]
+    res = {"issue": show_ref(ref), "pr": pr["number"] if pr else None, "pr_url": pr["url"] if pr else None,
+           "branch": branch, "commit": sha, "uat_plan": plans[0] if plans else None,
+           "pushed": target.startswith("origin/"), "note": note}
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return
+    where = f"PR #{pr['number']}, {pr['url']}" if pr else ("from GitHub, no PR yet" if res["pushed"] else "local, not pushed")
+    print(f"{OK} {show_ref(ref)}: testing {branch} at {sha[:8]} ({where})")
+    if note:
+        print(f"{WARN} {note}")
+    if (branch or "").lower().startswith("spike/"):
+        print("   A prototype: how to try it is in its notes (prototypes/<slug>/README.md or docs/spikes/).")
+    else:
+        print(f"   Test plan: {res['uat_plan'] or 'not found in docs/uat/ (ask the agent to run /uat)'}")
+    print("   Next: make setup && make dev, then follow the plan. Afterwards: python3 tools/haam/haam.py checkout-pr --back")
+
+
+def branch_prefix(ref):
+    return f"{ref}-" if isinstance(ref, int) else f"{ref.lower()}-"
+
+
+def branch_pattern(ref):
+    """An issue's branch: '12-…' (GitHub); 'app-12-…' or Linear's 'user/app-12-…'. Spikes never count."""
+    return re.compile(rf"^{ref}-" if isinstance(ref, int) else rf"^(?!spike/)(?:[^/]+/)?{re.escape(ref.lower())}-")
+
+
+def branch_issue(branch, like):
+    """The issue a branch is named after ('12-…' → 12, 'app-12-…' → 'APP-12'), or None. `like` picks the tracker's form."""
+    b = (branch or "").lower()
+    if isinstance(like, int):
+        m = re.match(r"^(\d+)-", b)
+        return int(m.group(1)) if m else None
+    m = re.match(r"^(?!spike/)(?:[^/]+/)?([a-z]{2,5}-\d+)-", b)
+    return m.group(1).upper() if m else None
+
+
+def named_branch(cfg, ref):
+    """The branch named in the issue's latest claim or UAT comment ("branch `…`"); a batch's branch is named after its
+    first issue, so the other issues are found this way. GitHub Projects only (on Linear, pass --branch)."""
+    if cfg.get("tracker") != "github" or not isinstance(ref, int):
+        return None
+    code, out, _ = run(["gh", "issue", "view", str(ref), "-R", cfg["github_repo"], "--json", "comments"])
+    bodies = [c.get("body", "") for c in (json.loads(out).get("comments") or [])] if code == 0 and out else []
+    for b_ in reversed(bodies):
+        m = re.search(r"branch `([^`\s]+)`", b_)
+        if m and "<" not in m.group(1):
+            return m.group(1)
+    return None
+
+
+def find_branch(root, cfg, ref, explicit=None):
+    """(branch, ref to check out, note) for an issue's branch. The branch on GitHub is the agent's hand-over, so it wins;
+    a branch only on this computer (an agent's worktree that hasn't pushed) is the fallback. Refuses to guess."""
+    lines = git_out(root, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin").splitlines()
+    remote = {b[len("origin/"):] for b in lines if b.startswith("origin/") and b != "origin/HEAD"}
+    local = {b for b in lines if not b.startswith("origin/") and b != "origin"}
+    others = []
+    if explicit:
+        names = {explicit}
+    else:
+        pat = branch_pattern(ref)
+        pushed = {b for b in remote if pat.search(b.lower())}
+        here = {b for b in local if pat.search(b.lower())}
+        names = pushed or here           # GitHub's branches are the hand-over; local-only ones are leftovers then
+        others = sorted(here - pushed) if pushed else []
+        if not names:
+            named = named_branch(cfg, ref)
+            names = {named} if named else set()
+    if len(names) > 1:
+        raise RuntimeError(f"Several branches match {show_ref(ref)}: {', '.join(sorted(names))}. "
+                           "Delete the stale one(s), or say which with --branch <name>.")
+    if not names:
+        return None, None, ""
+    name = names.pop()
+    if name in remote:
+        note = (f"Ignoring {', '.join(others)}: only on this computer. " if not explicit and others else "")
+        if name in local and git_out(root, "rev-parse", name) != git_out(root, "rev-parse", f"origin/{name}"):
+            note += (f"The copy of {name} on this computer differs from GitHub's. Testing GitHub's (the agent's "
+                    "hand-over); if the agent has commits it hasn't pushed, ask it to push and test again.")
+        return name, f"origin/{name}", note
+    if name in local:
+        return name, name, f"{name} is only on this computer (not pushed yet). Testing it as it is here."
+    if explicit:
+        raise RuntimeError(f"There's no branch {explicit}, here or on GitHub.")
+    return None, None, ""
+
+
+def tracker_issues(cfg, ref, branch, also):
+    """The issues one PR covers: this one, the issue the branch is named after (a batch), and --also."""
+    others = []
+    for x in (also or "").split(","):
+        if x.strip():
+            others.append(issue_ref(cfg, x))
+    lead = branch_issue(branch, ref)
+    issues = []
+    for n in [lead, ref] + others:
+        if n is not None and n not in issues:
+            issues.append(n)
+    return issues
+
+
+def status_ok(repo, sha, context):
+    """Whether this commit's latest `context` status is a success."""
+    code, data, _ = gh_api("GET", f"repos/{repo}/commits/{sha}/status?per_page=100")   # latest per context
+    return code == 0 and isinstance(data, dict) and any(
+        s.get("context") == context and s.get("state") == "success" for s in data.get("statuses") or [])
+
+
+def uat_status_ok(repo, sha):
+    """Whether the owner's pass is recorded on this exact commit (the `uat` commit status `publish` posts)."""
+    return status_ok(repo, sha, "uat")
+
+
+def cmd_publish(args):
+    """Test-first flow, after the owner's test passed: push exactly the tested commit and open the PR (already
+    labelled uat-passed, with a `uat` status on that commit), so CI and the reviews run once, on tested code."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    if not args.human:
+        sys.exit("Publishing follows the human's test. Run it only inside /test after they said 'pass', with --human.")
+    if git_paths(root)[2]:
+        sys.exit("publish runs only from the owner's own chat in the main project folder, never from an agent's worktree.")
+    ref = issue_ref(cfg, args.issue)
+    repo = cfg["github_repo"]
+    sha, tested_branch = tested_sha(root, ref), tested_branch_of(root, ref)
+    if (tested_branch or "").lower().startswith("spike/"):
+        sys.exit("That was a prototype (a spike branch): it never ships. Say discard, redo or keep (/test 3c).")
+    if not sha:
+        sys.exit(f"No record of a test for {show_ref(ref)}. Test it first: python3 tools/haam/haam.py checkout-pr {args.issue}")
+    run(["git", "fetch", "--quiet", "--prune", "origin"], cwd=root)
+    try:
+        pr = find_pr(cfg, ref, ("open",))
+        branch = pr["headRefName"] if pr else (tested_branch or find_branch(root, cfg, ref)[0])
+    except RuntimeError as e:
+        sys.exit(str(e))
+    if not branch:
+        sys.exit(f"No branch found for {show_ref(ref)}.")
+    if branch.lower().startswith("spike/"):
+        sys.exit("That's a prototype (a spike branch): it never ships. Say discard, redo or keep (/test 3c).")
+    if tested_branch and branch != tested_branch:
+        sys.exit(f"The test was of {tested_branch}, but the PR is on {branch}. Test it again first.")
+    issues = tracker_issues(cfg, ref, branch, args.also)     # read before pushing, so a bad ID changes nothing
+    tip = (git_out(root, "rev-parse", "--verify", "--quiet", f"origin/{branch}")
+           or git_out(root, "rev-parse", "--verify", "--quiet", branch))
+    if tip and tip != sha:
+        sys.exit(f"{branch} has changed since it was tested ({sha[:8]} → {tip[:8]}). Test it again first.")
+    code, _, err = run(["git", "push", "--quiet", "origin", f"{sha}:refs/heads/{branch}"], cwd=root)
+    if code != 0:
+        sys.exit(f"Couldn't push {branch}: {err[:200]} (if GitHub has commits the test didn't include, test again)")
+    who = gh_login() or "the owner"
+    when = time.strftime("%Y-%m-%d")
+    # The pass belongs to this commit: the gate drops uat-passed when a later push lacks this status.
+    code, _, err = gh_api("POST", f"repos/{repo}/statuses/{sha}", {
+        "state": "success", "context": "uat", "description": f"Tested and passed by @{who} on {when}"[:140]})
+    if code != 0:
+        sys.exit(f"Couldn't record the pass on the commit: {(err or '')[:200]}")
+    board = None
+    labels = ["uat-passed"] + [l for l in (args.label or []) if l != "uat-passed"]
+    title = args.title
+    if cfg.get("tracker") == "github":
+        board = GHProject(cfg)
+        board.load()
+        title = title or board.issue(issues[0])["title"]
+        if any("human-review" in board.issue(n)["labels"] for n in issues) and "human-review" not in labels:
+            labels.append("human-review")
+    title = title or re.sub(r"^(?:[^/]+/)?(?:\d+|[a-z]{2,5}-\d+)-", "", branch.lower()).replace("-", " ")
+    if not pr and setting_value(cfg, "grouping") == "release":
+        rel_now = (json.loads(tested_file(root).read_text()) if tested_file(root).exists() else {}).get("release") or {}
+        if show_ref(ref) in (rel_now.get("included") or {}):
+            print(f"{WARN} {show_ref(ref)} is already in release PR #{rel_now.get('pr')} with an earlier commit. That "
+                  "release ships the earlier one; to ship this one instead: ship --all --human --abandon-release",
+                  flush=True)
+        # Release grouping: no PR per change. The pass is recorded; ship --all puts every passed change into one
+        # release PR, so the checks and the AI reviews run once per release.
+        f = tested_file(root)
+        data = json.loads(f.read_text()) if f.exists() else {}
+        data.setdefault("passed", {})[show_ref(ref)] = {"sha": sha, "branch": branch, "title": title,
+                                                         "issues": [show_ref(n) for n in issues], "by": who, "on": when,
+                                                         "labels": [l for l in labels if l != "uat-passed"]}
+        f.write_text(json.dumps(data, indent=2) + "\n")
+        steps = []
+        for n in issues:
+            msg = f"✅ Tested and passed by @{who} at `{sha[:8]}`. It goes out with the next release (`ship --all`)."
+            if board:
+                board.set_option(board.issue(n), "Status", "In Review")
+                run(["gh", "issue", "comment", str(n), "-R", repo, "--body", msg])
+            else:
+                steps.append(f"{show_ref(n)}: status In Review; comment \"{msg}\"")
+        if args.json:
+            print(json.dumps({"issue": show_ref(ref), "issues": [show_ref(n) for n in issues], "branch": branch,
+                              "commit": sha, "pr_url": None, "release": True, "tracker_steps": steps}, indent=2))
+            return
+        print(f"{OK} Passed {', '.join(show_ref(n) for n in issues)} at {sha[:8]}: it goes out with the next release.")
+        for st_ in steps:
+            print(f"   Linear (do it with the Linear connection): {st_}")
+        print("   When you're ready: python3 tools/haam/haam.py ship --all --human (one release PR, one deploy)")
+        return
+    if pr:
+        num = str(pr["number"])
+        run(["gh", "pr", "edit", num, "-R", repo] + sum((["--add-label", l] for l in labels), []))
+        if pr.get("isDraft"):     # after the label, so the ready_for_review run of the gate sees it
+            run(["gh", "pr", "ready", num, "-R", repo])
+        run(["gh", "pr", "comment", num, "-R", repo, "--body",
+             f"✅ Re-tested and passed by @{who} on {when} at `{sha[:8]}`."])
+        url = pr["url"]
+    else:
+        ids = " ".join(show_ref(n) for n in issues)
+        refs = "\n".join(f"Refs {show_ref(n)}" for n in issues)
+        plan = next(iter(sorted((root / "docs/uat").glob(f"{file_id(issues[0])}-*.md"))), None)
+        body = (f"{refs}\n\n## Tested first\n✅ Tested and passed by @{who} on {when} at `{sha[:8]}`, before any "
+                "checks ran (HAAM test-first). The checks and reviews below run once, on exactly this commit.\n\n"
+                + (f"Test plan: `{plan.relative_to(root).as_posix()}`\n\n" if plan else "")
+                + "Acceptance criteria, tests and *Built with*: see the spec, the test plan and the claim comment on the issue.\n")
+        f = root / ".haam" / f"pr-{file_id(ref)}.md"
+        f.parent.mkdir(exist_ok=True)
+        f.write_text(body)
+        cmd = ["gh", "pr", "create", "-R", repo, "--head", branch, "--base", cfg.get("default_branch") or "main",
+               "--title", f"{ids}: {title}", "--body-file", str(f)]
+        for lab in labels:
+            cmd += ["--label", lab]
+        code, out, err = run(cmd)
+        f.unlink()
+        if code != 0:
+            sys.exit(f"Couldn't open the PR: {(err or out)[:200]}")
+        url = out.strip().splitlines()[-1] if out else ""
+        num = url.rstrip("/").rsplit("/", 1)[-1]
+    # An agent may have pushed between our push and the PR: then the PR isn't what was tested.
+    head = pr_head(repo, num)
+    if head and head != sha:
+        run(["gh", "pr", "edit", num, "-R", repo, "--remove-label", "uat-passed"])
+        run(["gh", "pr", "ready", num, "--undo", "-R", repo])      # back to draft: no checks on untested code
+        sys.exit(f"{branch} changed while the PR was being opened ({sha[:8]} → {head[:8]}), so it isn't what you tested. "
+                 f"Removed uat-passed. Test it again: python3 tools/haam/haam.py checkout-pr {args.issue}")
+    linear_steps = []
+    for n in issues:
+        if board:
+            iss = board.issue(n)
+            board.set_option(iss, "Status", "In Review")
+            run(["gh", "issue", "comment", str(n), "-R", repo, "--body",
+                 f"✅ Tested and passed by @{who} at `{sha[:8]}`. PR: {url} (checks running)"])
+        else:
+            linear_steps.append(f"{show_ref(n)}: status In Review; comment \"✅ Tested and passed by @{who} at "
+                                f"{sha[:8]}. PR: {url} (checks running)\"")
+    res = {"issue": show_ref(ref), "issues": [show_ref(n) for n in issues], "branch": branch, "commit": sha,
+           "pr_url": url, "labels": labels, "tracker_steps": linear_steps}
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return
+    print(f"{OK} Pushed {branch} at {sha[:8]} and opened {url}" if not pr else f"{OK} Pushed the tested commit to {url}")
+    for s in linear_steps:
+        print(f"   Linear (do it with the Linear connection): {s}")
+    print("   CI and the reviews run now, once. Then: python3 tools/haam/haam.py ship " + str(args.issue) + " --human")
+
+
+def cmd_test_failed(args):
+    """The owner's test failed: withdraw any earlier pass of that commit (the `uat` status, the PR's uat-passed),
+    so neither ship nor the gate can use it. The skills record the failures on the issue."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    if not args.human:
+        sys.exit("A test result is the human's. Run it only inside /test or /uat-result after they said it failed, with --human.")
+    ref = issue_ref(cfg, args.issue)
+    repo = cfg["github_repo"]
+    sha = tested_sha(root, ref)
+    done = []
+    if sha:
+        code, _, _ = gh_api("POST", f"repos/{repo}/statuses/{sha}", {
+            "state": "failure", "context": "uat", "description": f"Failed the owner's test on {time.strftime('%Y-%m-%d')}"})
+        if code == 0:      # a commit that never reached GitHub has nothing to withdraw
+            done.append(f"marked {sha[:8]} as failed")
+    try:
+        pr = find_pr(cfg, ref, ("open",))
+    except RuntimeError as e:
+        sys.exit(str(e))
+    if pr and "uat-passed" in [l["name"] for l in pr.get("labels") or []]:
+        run(["gh", "pr", "edit", str(pr["number"]), "-R", repo, "--remove-label", "uat-passed"])
+        done.append(f"removed uat-passed from PR #{pr['number']}")
+    f = tested_file(root)
+    data = json.loads(f.read_text()) if f.exists() else {}
+    if (data.get("passed") or {}).pop(show_ref(ref), None):
+        f.write_text(json.dumps(data, indent=2) + "\n")
+        done.append("taken out of the next release")
+    res = {"issue": show_ref(ref), "commit": sha, "pr": pr["number"] if pr else None, "done": done}
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return
+    print(f"{OK} {show_ref(ref)}: " + ("; ".join(done) if done else "no earlier pass to withdraw"))
+
+
+SHIP_NOT_FINISHED = 2   # exit code: nothing went wrong, it just isn't finished; run the same command again
+SHIP_WAITING_HUMAN = 3  # exit code: waiting for the human (manual deploy): don't re-run until they say it's live
+
+
+def checks_grace_seconds():
+    """How long a just-opened PR may show no checks before that counts as a problem (they take a moment to start)."""
+    try:
+        return float(os.environ.get("HAAM_CHECKS_GRACE_SECONDS", "300"))
+    except ValueError:
+        return 300.0
+
+
+def pr_checks(repo, num):
+    """(passed, pending, failed) check names for a PR, from GitHub; None while no check has started yet."""
+    code, out, err = run(["gh", "pr", "checks", str(num), "-R", repo, "--json", "name,bucket"])
+    if code != 0 and "no checks reported" in (err or out or "").lower():
+        return None
+    if code not in (0, 8) or not out:   # gh exits 8 while checks are pending
+        raise RuntimeError(f"Couldn't read the PR's checks: {(err or out)[:200]}")
+    checks = json.loads(out)
+    passed = [c["name"] for c in checks if c["bucket"] in ("pass", "skipping")]
+    pending = [c["name"] for c in checks if c["bucket"] == "pending"]
+    failed = [c["name"] for c in checks if c["bucket"] in ("fail", "cancel")]
+    return passed, pending, failed
+
+
+def pr_quiet_seconds(repo, num):
+    """Seconds since the PR was last updated (opened, marked ready, labelled), or None if unknown."""
+    code, out, _ = run(["gh", "pr", "view", str(num), "-R", repo, "--json", "updatedAt"])
+    try:
+        return time.time() - iso_time(json.loads(out)["updatedAt"]).timestamp() if code == 0 and out else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def pr_head(repo, num):
+    code, out, _ = run(["gh", "pr", "view", str(num), "-R", repo, "--json", "headRefOid"])
+    return (json.loads(out).get("headRefOid") if code == 0 and out else "") or ""
+
+
+def commit_contains(repo, older, newer, cache=None):
+    """Whether commit `newer` includes `older` (same commit, or later on the same history)."""
+    if not older or not newer:
+        return False
+    if older == newer:
+        return True
+    key = (older, newer)
+    if cache is not None and key in cache:
+        return cache[key]
+    code, data, _ = gh_api("GET", f"repos/{repo}/compare/{older}...{newer}")
+    res = code == 0 and isinstance(data, dict) and data.get("status") in ("ahead", "identical")
+    if cache is not None:
+        cache[key] = res
+    return res
+
+
+def await_deploy(repo, workflow, shas, deadline, say, merged_age=0, branch="main"):
+    """Approve and wait for ONE production deploy that carries every commit in `shas` (the newest last).
+    A waiting older deploy run is cancelled (the newer one includes its change), and a run that GitHub cancelled
+    because a newer merge replaced it just means waiting for that newer one.
+    Returns (outcome, url or message, deployed sha): outcome is live, later, stop or failed."""
+    last, cache, cancelled = shas[-1], {}, set()
+    while True:
+        code, out, err = run(["gh", "run", "list", "-R", repo, "--workflow", workflow, "--branch", branch, "--limit", "30",
+                              "--json", "databaseId,status,conclusion,url,headSha"])
+        if code != 0:
+            return "stop", f"Couldn't list the deploy runs: {(err or out)[:200]}", None
+        runs = json.loads(out or "[]")                      # newest first
+        containing = [i for i, r in enumerate(runs) if commit_contains(repo, last, r.get("headSha"), cache)]
+        done = next((runs[i] for i in containing if runs[i]["status"] == "completed"
+                     and runs[i]["conclusion"] == "success"), None)
+        if done:          # some deploy that includes these changes went out (even if a later one didn't)
+            say(f"{OK} Deployed: {done['url']}")
+            return "live", done["url"], done.get("headSha")
+        idx = containing[0] if containing else None
+        target = runs[idx] if idx is not None else None
+        if target:
+            for old in runs[idx + 1:]:
+                if old["status"] in ("waiting", "pending", "queued", "requested") and old["databaseId"] not in cancelled \
+                        and commit_contains(repo, old.get("headSha"), target.get("headSha"), cache):
+                    cancelled.add(old["databaseId"])
+                    run(["gh", "run", "cancel", str(old["databaseId"]), "-R", repo])
+                    say(f"{INFO} Cancelled an older waiting deploy run (this one includes its change): {old['url']}")
+            if target["status"] == "completed":
+                if target["conclusion"] == "cancelled":
+                    # Replaced by a newer merge's run, it would be listed (and newer). There's none, so someone
+                    # cancelled it: don't wait for a deploy that isn't coming.
+                    return "stop", (f"The deploy run was cancelled: {target['url']}. Ask the human whether to "
+                                    "re-run it (Actions → the run → Re-run) before running this again."), None
+                say(f"{BAD} The deploy failed: {target['url']}")
+                return "failed", target["url"], None
+            if target["status"] == "waiting":
+                c2, pend, _ = gh_api("GET", f"repos/{repo}/actions/runs/{target['databaseId']}/pending_deployments")
+                pend = pend if isinstance(pend, list) else []
+                mine = [p["environment"]["id"] for p in pend if p.get("current_user_can_approve", True)]
+                if pend and not mine:
+                    return "later", ("You can't approve this environment: the approver must approve it in GitHub "
+                                     "(Actions → the run → Review deployments)."), None
+                if mine:
+                    c3, _, e3 = gh_api("POST", f"repos/{repo}/actions/runs/{target['databaseId']}/pending_deployments",
+                                       {"environment_ids": mine, "state": "approved",
+                                        "comment": f"Approved by {gh_login() or 'the product owner'} (HAAM ship)"})
+                    if c3 != 0:
+                        return "stop", (f"Couldn't approve the deploy ({str(e3)[:150]}). Approve it in GitHub: Actions "
+                                        "→ the run → Review deployments."), None
+                    say(f"{OK} Approved the production deploy")
+        if time.time() > deadline:
+            if target:
+                return "later", f"Deploy run: {target['url']}.", None
+            if merged_age < 600:
+                return "later", f"No '{workflow}' run for the merge yet.", None
+            return "stop", (f"No '{workflow}' run started for the merge. Ask the human how this project deploys; only "
+                            "if they confirm it's live, run again with --no-deploy (or --live)."), None
+        time.sleep(poll_seconds())
+
+
+def close_released(cfg, repo, deployed_sha, run_url, exclude, say):
+    """Close issues still in Deploying whose merged change went out in this deploy (e.g. the no-UAT lane's)."""
+    if cfg.get("tracker") != "github" or not deployed_sha:
+        return
+    board = GHProject(cfg)
+    board.load()
+    cache = {}
+    for item in board.items():
+        n = item["number"]
+        if item["status"] != "Deploying" or item["state"] != "OPEN" or n in exclude:
+            continue
+        try:
+            pr = find_pr(cfg, n, ("merged",))
+        except RuntimeError:
+            continue
+        if not pr:
+            continue
+        c, o, _ = run(["gh", "pr", "view", str(pr["number"]), "-R", repo, "--json", "mergeCommit"])
+        m = ((json.loads(o) if c == 0 and o else {}).get("mergeCommit") or {}).get("oid")
+        if m and commit_contains(repo, m, deployed_sha, cache):
+            iss = board.issue(n)
+            board.set_option(iss, "Status", "Done")
+            run(["gh", "issue", "comment", str(n), "-R", repo, "--body", f"🚀 Released to production · deploy run {run_url}"])
+            run(["gh", "issue", "close", str(n), "-R", repo, "--reason", "completed"])
+            say(f"{OK} #{n} is live and Done (it went out in the same deploy)")
+
+
+def ship_candidates(cfg, repo):
+    """`ship --all`: open PRs that passed UAT or are in the no-UAT lane, plus merged ones still waiting to deploy."""
+    refs = []
+    code, out, _ = run(["gh", "pr", "list", "-R", repo, "--state", "open", "--limit", "200",
+                        "--json", "number,title,headRefName,labels,isDraft"])
+    for p in json.loads(out or "[]") if code == 0 else []:
+        names = [l["name"] for l in p.get("labels") or []]
+        ready = "uat-passed" in names or "gate-override" in names or ("uat:skip" in names and "human-review" not in names)
+        if p.get("isDraft") or not ready:
+            continue
+        ids = pr_title_issues(p) or [i for i in [branch_issue(p.get("headRefName"), 1 if cfg.get("tracker") == "github" else "X-1")]
+                                     if i is not None]
+        if ids:
+            refs.append(ids[0])
+    if cfg.get("tracker") == "github":
+        board = GHProject(cfg)
+        board.load()
+        refs += [i["number"] for i in board.items() if i["status"] == "Deploying" and i["state"] == "OPEN"
+                 and i["number"] not in refs]
+    return refs
+
+
+def tidy_worktrees(root, cfg, say):
+    """worktree_cleanup = after-ship: remove agents' worktrees whose work is merged or abandoned (nothing unsaved)."""
+    if setting_value(cfg, "worktree_cleanup") != "after-ship":
+        return
+    c, o, _ = run([sys.executable, str(Path(__file__).resolve()), "worktree", "clean", "--apply"], cwd=root)
+    last = [l for l in (o or "").splitlines() if l.strip()]
+    if c == 0 and last:
+        say(f"{INFO} Worktrees tidied: {last[-1].strip()}")
+
+
+MIGRATION_PATTERNS = ["**/migrations/**", "**/migration/**", "**/migrate/**", "**/*.sql"]
+
+
+def issue_number_key(key):
+    """Sort key for an issue ID by its number as a number: #852 before #1879 (as text, "#1879" < "#852")."""
+    m = re.search(r"(\d+)\D*$", str(key or ""))
+    return (int(m.group(1)) if m else 10 ** 9, str(key))
+
+
+def release_order(items, first=()):
+    """The order a release takes passed changes in: the ones the owner named with --first (in the order given), then
+    by issue number as a number, a change for several issues by its lowest."""
+    pos = {k: i for i, k in enumerate(first)}
+
+    def key(kv):
+        k, v = kv
+        if k in pos:
+            return (0, (pos[k], ""))
+        return (1, min(issue_number_key(i) for i in (v.get("issues") or [k])))
+    return sorted(items, key=key)
+
+
+def merges_cleanly(cwd, a, b):
+    """True when commits a and b merge without a conflict, False when they conflict, None when git can't say (older
+    than 2.38). Nothing is written to any branch or worktree."""
+    p = subprocess.run(["git", "merge-tree", "--write-tree", "--quiet", a, b], cwd=cwd, capture_output=True, text=True)
+    return True if p.returncode == 0 else False if p.returncode == 1 else None
+
+
+def compose_release(root, wt, base_sha, items, first=()):
+    """Merge passed changes, in order, into the detached worktree `wt` (made from base_sha). The real ship and
+    `ship --plan` both run this, so a plan can't disagree with the merge. Returns (included, left_out, clashes):
+    included [(key, v)]; left_out [{key, why}] (changed after the test, or conflicts with main itself); clashes
+    [{key, with}]: a change that conflicts with one already in (`with`: its key, or None when only with the changes
+    before it together), which the owner decides (`--first`), unless the change it clashes with is one they put first."""
+    included, left_out, clashes = [], [], []
+    for key, v in items:
+        tip = git_out(root, "rev-parse", "--verify", "--quiet", f"origin/{v['branch']}")
+        if tip and tip != v["sha"]:
+            left_out.append({"key": key, "why": f"changed after your test ({v['sha'][:8]} → {tip[:8]}): test it again"})
+            continue
+        c2, _, _ = run(["git", "merge", "--no-ff", "--no-edit", "-m", f"{' '.join(v['issues'])}: {v['title']}",
+                        v["sha"]], cwd=wt)
+        if c2 == 0:
+            included.append((key, v))
+            continue
+        run(["git", "merge", "--abort"], cwd=wt)
+        if merges_cleanly(wt, base_sha, v["sha"]) is not True:
+            left_out.append({"key": key, "why": "conflicts with main: send it back to an agent to rebase on main, then "
+                                                "test it again"})
+            continue
+        partner = next((k2 for k2, v2 in included if merges_cleanly(wt, v2["sha"], v["sha"]) is False), None)
+        if partner is not None and partner in first:
+            left_out.append({"key": key, "why": f"clashes with {partner}, which you put first: send it back to an agent "
+                                                "to rebase on main, then test it again"})
+        else:
+            clashes.append({"key": key, "with": partner})
+    return included, left_out, clashes
+
+
+def clash_question(clashes):
+    """What the owner is asked when passed changes clash: never left to the sort order."""
+    lines = []
+    for c in clashes:
+        k, w = c["key"], c["with"]
+        if w:
+            lines.append(f"{k} and {w} change the same lines. Say which goes first: `--first {k.lstrip('#')}` puts {k} "
+                         f"in and leaves {w} out (to rebase and test again); `--first {w.lstrip('#')}` the other way.")
+        else:
+            lines.append(f"{k} conflicts with the changes before it together. `--first {k.lstrip('#')}` puts it in first "
+                         f"(what it clashes with is then left out), or `--without {k.lstrip('#')}` leaves it out.")
+    return lines
+
+
+def release_composition(root, cfg, items, first=(), keep=False):
+    """Compose a release from `items` in a temporary worktree from a fresh origin/<base>. Returns a dict: base, wt
+    (when keep, the caller removes it), head, included, left_out, clashes, files, protected, migrations."""
+    run(["git", "fetch", "--quiet", "--prune", "origin"], cwd=root)
+    base = cfg.get("default_branch") or "main"
+    _, main, _ = git_paths(root)
+    wt = main / ".haam" / ("release-build" if keep else "release-plan")
+    run(["git", "worktree", "remove", "--force", str(wt)], cwd=root)
+    code, _, err = run(["git", "worktree", "add", "--detach", str(wt), f"origin/{base}"], cwd=root)
+    if code != 0:
+        raise RuntimeError(f"Couldn't prepare the release: {err[:200]}")
+    try:
+        base_sha = git_out(wt, "rev-parse", "HEAD")
+        included, left_out, clashes = compose_release(root, wt, base_sha, items, first)
+        head = git_out(wt, "rev-parse", "HEAD")
+        _, names, _ = run(["git", "diff", "--name-only", "--no-renames", base_sha, head], cwd=wt)
+        files = [f for f in (names or "").splitlines() if f]
+    finally:
+        if not keep:
+            run(["git", "worktree", "remove", "--force", str(wt)], cwd=root)
+    return {"base": base, "base_sha": base_sha, "wt": wt if keep else None, "head": head, "included": included,
+            "left_out": left_out, "clashes": clashes, "files": files,
+            "protected": protected_matches(cfg.get("protected_paths"), files),
+            "migrations": protected_matches(MIGRATION_PATTERNS, files)}
+
+
+def release_items(args, cfg, data):
+    """The passed changes a new release may take: not already in a release that is merged and waiting for its
+    deploy (the same tested commit), and not left out with --without; only those named, when ship names issues."""
+    passed = data.get("passed") or {}
+    taken = {}
+    for r in (data.get("awaiting_live") or []) + ([data["release"]] if data.get("release") else []):
+        taken.update({k: v.get("sha") for k, v in (r.get("included") or {}).items()})
+    wanted = {show_ref(issue_ref(cfg, x)) for x in (args.issue or [])}
+    without = {show_ref(issue_ref(cfg, x)) for x in (getattr(args, "without", None) or [])}
+    return [(k, v) for k, v in passed.items()
+            if taken.get(k) != v.get("sha") and k not in without and (not wanted or k in wanted)]
+
+
+def verified_release_items(root, cfg, data, args):
+    """uat: agents-verify (as main has it): the tickets an independent verifier verified, for the owner's `ship` to
+    take into the release beside the ones they passed. Returns (items, left_out): an item goes in only while its
+    verification still covers the branch's tip (the agent-verified status on the verified commit), its lane is still
+    `agents` against today's main, it has no owner-test, and it wasn't verified during the shadow start (then only
+    the owner's own pass ships it). Each one kept out is named with its reason."""
+    if cfg.get("tracker") != "github":
+        return [], []
+    lcfg = lane_config(root)
+    if setting_value(lcfg, "uat") != "agents-verify":
+        return [], []          # the lane is off: ship ignores agent-verified
+    repo = cfg["github_repo"]
+    c, o, _ = run(["gh", "issue", "list", "-R", repo, "--state", "open", "--label", "verified-by-agents", "--limit",
+                   "200", "--json", "number,title,labels"])
+    found = json.loads(o) if c == 0 and o else []
+    passed = data.get("passed") or {}
+    taken = set()
+    for r in (data.get("awaiting_live") or []) + ([data["release"]] if data.get("release") else []):
+        taken.update(r.get("included") or {})
+    wanted = {show_ref(issue_ref(cfg, x)) for x in (args.issue or [])}
+    without = {show_ref(issue_ref(cfg, x)) for x in (getattr(args, "without", None) or [])}
+    items, left = [], []
+    for it in found:
+        key = f"#{it['number']}"
+        if key in passed or key in taken or key in without or (wanted and key not in wanted):
+            continue
+        labels = [l["name"] if isinstance(l, dict) else l for l in it.get("labels") or []]
+        d = lane_details(root, lcfg, it["number"], labels=labels)
+        if d["lane"] != "agents":
+            left.append({"key": key, "why": f"verified by agents, but it's your test now: {d['reason']}"})
+            continue
+        st = verification_state(root, lcfg, it["number"], labels, issue_comments(repo, it["number"]), d["head"])
+        if not st["verified"]:
+            left.append({"key": key, "why": f"not verified any more: {st['why']}"})
+            continue
+        if st["shadow"]:
+            left.append({"key": key, "why": "verified during the shadow start: it ships on your own pass"})
+            continue
+        items.append((key, {"sha": d["head"], "branch": d["branch"], "title": it["title"], "issues": [key],
+                            "by": None, "on": (st["at"] or "")[:10], "labels": [l for l in labels if l == "human-review"],
+                            "verified": {"claim": st["claim"], "tool": st["tool"], "at": st["at"],
+                                         "risk": (d.get("plan_fields") or {}).get("risk")}}))
+    return items, left
+
+
+def how_checked(v):
+    """The release table's wording: the owner's pass, or the agents' verification. Never one for the other."""
+    if v.get("verified"):
+        return f"Verified by agents (claim {v['verified'].get('claim') or '?'}) on {v.get('on') or '?'}"
+    return f"Tested and passed by @{v.get('by') or '?'} on {v.get('on') or '?'}"
+
+
+def print_release_plan(comp, args, awaiting):
+    """`ship --plan`: what the release would be, in the tool's own order, with nothing merged or pushed."""
+    plan = {"in": [{"key": k, "issues": v["issues"], "title": v["title"], "sha": v["sha"], "by": v.get("by"),
+                    "on": v.get("on"), "checked": "verified" if v.get("verified") else "passed",
+                    **({"claim": v["verified"].get("claim"), "risk": v["verified"].get("risk")} if v.get("verified")
+                       else {})} for k, v in comp["included"]],
+            "left_out": comp["left_out"], "clashes": comp["clashes"], "question": clash_question(comp["clashes"]),
+            "files": comp["files"], "protected": comp["protected"], "migrations": comp["migrations"],
+            "base": comp["base_sha"], "waiting_for_deploy": [r["pr"] for r in awaiting]}
+    if args.json:
+        print(json.dumps(plan, indent=2))
+        return
+    print(f"Release plan on {comp['base']} ({comp['base_sha'][:8]}); nothing is merged or pushed. "
+          "Order: --first, then by issue number.")
+    if awaiting:
+        print(f"{INFO} Merged and waiting for the deploy: " + ", ".join(f"release PR #{r['pr']} ({', '.join(r['issues'])})"
+                                                                      for r in awaiting))
+    print("In, in this order:" if comp["included"] else "Nothing would go in.")
+    for i, (k, v) in enumerate(comp["included"], 1):
+        if v.get("verified"):
+            continue
+        print(f"  {i}. {' '.join(v['issues'])}: {v['title']} · tested {v['sha'][:8]}"
+              + (f" · passed by @{v['by']} on {v['on']}" if v.get("by") else ""))
+    ver = [(i, v) for i, (_, v) in enumerate(comp["included"], 1) if v.get("verified")]
+    if ver:
+        print("Verified by agents, not passed by you (`ship without <IDs>` leaves any out):")
+        for i, v in ver:
+            print(f"  {i}. {' '.join(v['issues'])}: {v['title']} · verified {v['sha'][:8]} "
+                  f"(claim {v['verified'].get('claim')}) · risk {v['verified'].get('risk') or '?'}")
+    for x in comp["left_out"]:
+        print(f"{WARN} Left out: {x['key']}: {x['why']}")
+    for q in clash_question(comp["clashes"]):
+        print(f"{WARN} Clash: {q}")
+    shown = comp["files"][:15]
+    print(f"Files: {len(comp['files'])} changed" + (f" ({', '.join(shown)}{' …' if len(comp['files']) > 15 else ''})"
+                                                    if shown else ""))
+    if comp["protected"]:
+        print(f"{WARN} Protected areas: {', '.join(comp['protected'][:15])}")
+    if comp["migrations"]:
+        print(f"{WARN} Looks like database migrations: {', '.join(comp['migrations'][:15])}")
+
+
+def release_merge_commit(repo, rel):
+    """The merge commit of a release PR on GitHub, or None."""
+    c, o, _ = run(["gh", "pr", "view", str(rel["pr"]), "-R", repo, "--json", "state,mergeCommit"])
+    v = json.loads(o) if c == 0 and o else {}
+    return (v.get("mergeCommit") or {}).get("oid") if v.get("state") == "MERGED" else None
+
+
+def forget_release(repo, data, rel):
+    """A release is live: forget its passes (unless re-passed since) and delete its changes' branches (if nobody
+    pushed since)."""
+    for k, v in (rel.get("included") or {}).items():
+        if ((data.get("passed") or {}).get(k) or {}).get("sha") == v["sha"]:
+            data["passed"].pop(k, None)
+        c6, ref_, _ = gh_api("GET", f"repos/{repo}/git/ref/heads/{v['branch']}")
+        if c6 == 0 and isinstance(ref_, dict) and (ref_.get("object") or {}).get("sha") == v["sha"]:
+            gh_api("DELETE", f"repos/{repo}/git/refs/heads/{v['branch']}")
+
+
+def cadence_file(root):
+    _, main, _ = git_paths(root)
+    return main / ".haam" / "cadence.json"
+
+
+ISSUE_IN_SUBJECT_RE = re.compile(r"^((?:(?:#\d+|[A-Z][A-Z0-9]+-\d+)[\s,]*)+):")
+
+
+def cadence_report(root, cfg):
+    """What /cadence reads: the passed changes waiting for a release, whether a release is due (and why), and for
+    each release target (a build that ships on its own, e.g. a phone app) how many changes touch it since its last
+    build. Nothing is changed."""
+    tf = tested_file(root)
+    data = json.loads(tf.read_text()) if tf.exists() else {}
+    args_ = argparse.Namespace(issue=None, without=None)
+    items = release_items(args_, cfg, data)
+    awaiting = (data.get("awaiting_live") or []) + ([data["release"]] if data.get("release") else [])
+    every = int(setting_value(cfg, "release_after_passed") or 0)
+    days = int(setting_value(cfg, "release_after_days") or 0)
+    today = time.time()
+
+    def age_days(v):
+        try:
+            return (today - time.mktime(time.strptime(v.get("on") or "", "%Y-%m-%d"))) / 86400
+        except ValueError:
+            return 0.0
+    ages = [age_days(v) for _, v in items]
+    oldest = max(ages) if ages else 0.0
+    urgent = []
+    if items and cfg.get("tracker") == "github":
+        try:
+            board = GHProject(cfg)
+            board.load()
+            byn = {f"#{i['number']}": i for i in board.items()}
+            for k, v in items:
+                for ref in v.get("issues") or [k]:
+                    it = byn.get(ref) or {}
+                    if it.get("priority") == "Urgent" or "security" in (it.get("labels") or []) \
+                            or "security" in (v.get("labels") or []):
+                        urgent.append(ref)
+        except RuntimeError:
+            pass
+    reasons = []
+    if urgent:
+        reasons.append(f"urgent: {', '.join(urgent)}")
+    if every and len(items) >= every:
+        reasons.append(f"{len(items)} changes passed (the setting is {every})")
+    if days and items and oldest >= days:
+        reasons.append(f"the oldest passed change has waited {int(oldest)} days (the setting is {days})")
+
+    targets = []
+    run(["git", "fetch", "--quiet", "origin"], cwd=root)
+    base = f"origin/{cfg.get('default_branch') or 'main'}"
+    built = (json.loads(cadence_file(root).read_text()) if cadence_file(root).exists() else {}).get("built") or {}
+    for name, pats in (cfg.get("release_targets") or {}).items():
+        refs = set()
+        last = (built.get(name) or {}).get("sha")
+        if last and git_out(root, "cat-file", "-t", last) == "commit":
+            # Each change's own merge commit ("#12: …") names the issue; its files say whether it touches the target.
+            _, names, _ = run(["git", "log", "--format=%x00%s", "--name-only", "--no-renames", f"{last}..{base}"],
+                              cwd=root)
+            for block in (names or "").split("\x00"):
+                lines = [x for x in block.splitlines() if x.strip()]
+                if not lines:
+                    continue
+                m = ISSUE_IN_SUBJECT_RE.match(lines[0])
+                if m and protected_matches(pats, lines[1:]):
+                    refs.update(re.findall(r"#\d+|[A-Z][A-Z0-9]+-\d+", m.group(1)))
+        for k, v in items:
+            mb = git_out(root, "merge-base", base, v["sha"]) if v.get("sha") else ""
+            if mb:
+                _, names, _ = run(["git", "diff", "--name-only", "--no-renames", mb, v["sha"]], cwd=root)
+                if protected_matches(pats, [x for x in (names or "").splitlines() if x]):
+                    refs.update(v.get("issues") or [k])
+        due = bool(every) and len(refs) >= every
+        targets.append({"name": name, "changes": sorted(refs, key=issue_number_key), "count": len(refs), "due": due,
+                        "last_build": built.get(name), "since": "its last build" if last else "ever (no build recorded)"})
+    return {"passed": [k for k, _ in release_order(items)], "count": len(items), "oldest_days": round(oldest, 1),
+            "urgent": urgent, "due": bool(reasons), "reasons": reasons, "settings": {"release_after_passed": every,
+            "release_after_days": days}, "waiting_for_deploy": [r["pr"] for r in awaiting], "targets": targets}
+
+
+def cmd_cadence(args):
+    """Whether a release is due by the owner's cadence (release_after_passed, release_after_days, an urgent change),
+    and how many changes each release target (a phone build) has waiting. /cadence reads it; it changes nothing,
+    except `--built <target>`, which records that the owner's build of that target took origin's main now."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    if args.built:
+        if not args.human:
+            sys.exit("--built records the owner's build: add --human (inside /cadence, after the owner's word).")
+        if args.built not in (cfg.get("release_targets") or {}):
+            sys.exit(f"No release target named {args.built!r} (config --release-target {args.built}=<paths> --human).")
+        run(["git", "fetch", "--quiet", "origin"], cwd=root)
+        sha = args.sha or git_out(root, "rev-parse", f"origin/{cfg.get('default_branch') or 'main'}")
+        f = cadence_file(root)
+        state = json.loads(f.read_text()) if f.exists() else {}
+        state.setdefault("built", {})[args.built] = {"sha": sha, "at": time.strftime("%Y-%m-%d %H:%M")}
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(state, indent=2) + "\n")
+        print(f"{OK} {args.built}: build recorded at {sha[:8]}; its count starts again from there.")
+        return
+    rep = cadence_report(root, cfg)
+    if args.json:
+        print(json.dumps(rep, indent=2))
+        return
+    st = rep["settings"]
+    rule = (f"release after {st['release_after_passed'] or '–'} passed changes or {st['release_after_days'] or '–'} "
+            "days; urgent at once")
+    if rep["due"]:
+        print(f"{OK} A release is due ({rule}): " + "; ".join(rep["reasons"]) + ".")
+    elif rep["count"]:
+        print(f"{INFO} Not due yet ({rule}): {rep['count']} passed, the oldest {rep['oldest_days']:g} days.")
+    else:
+        print(f"{INFO} Nothing has passed since the last release ({rule}).")
+    if rep["count"]:
+        print("Passed, in release order: " + ", ".join(rep["passed"]))
+    if rep["waiting_for_deploy"]:
+        print(f"{INFO} Merged and waiting for the deploy: " + ", ".join(f"release PR #{n}" for n in rep["waiting_for_deploy"]))
+    for t in rep["targets"]:
+        print(f"{OK if t['due'] else INFO} {t['name']}: {t['count']} change(s) since {t['since']}"
+              + (" — a build is due" if t["due"] else "") + (f": {', '.join(t['changes'][:20])}" if t["changes"] else ""))
+
+
+def ship_release(args, root, cfg):
+    """grouping = release: everything the owner passed goes into ONE release PR (merged together on a fresh branch
+    from main), which gets the checks and the AI reviews once, then merges and deploys once.
+    With `deploy: manual`, a merged release waits for the owner's deploy without holding up the next one: the next
+    `ship` builds a new release from what passed since, and `--live` closes every release the deploy contained.
+    `--plan` shows what the release would be and does nothing else.
+    Returns the exit code (0 also when nothing had passed); exits itself only when it can't go on."""
+    repo = cfg["github_repo"]
+    me = [sys.executable, str(Path(__file__).resolve())]
+    tf = tested_file(root)
+    data = json.loads(tf.read_text()) if tf.exists() else {}
+    manual = cfg.get("deploy") == "manual"
+
+    def save():
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps(data, indent=2) + "\n")
+
+    def out(state, code, message):
+        if args.json:
+            print(json.dumps({"ok": code == 0, "state": state, "message": message}, indent=2))
+        else:
+            print(message, flush=True)
+        sys.exit(code)
+
+    def result(state, code, message):
+        if not args.json:
+            print(message, flush=True)
+        args._release_result = {"ok": code == 0, "state": state, "message": message}
+        return code
+
+    rel = data.get("release")
+    if rel and not args.plan:
+        c_v, o_v, _ = run(["gh", "pr", "view", str(rel["pr"]), "-R", repo, "--json", "state,headRefOid"])
+        live = json.loads(o_v) if c_v == 0 and o_v else {}
+        if live.get("state") == "MERGED" and args.abandon_release:
+            print(f"{WARN} Release PR #{rel['pr']} is already merged, so it can't be abandoned: carrying on with its "
+                  "deploy.", flush=True)
+        why = ("" if live.get("state") == "MERGED" else
+               "you asked to abandon it" if args.abandon_release else
+               "it was closed" if live.get("state") == "CLOSED" else
+               "someone pushed to it after it was built" if live.get("state") == "OPEN" and live.get("headRefOid")
+               and live["headRefOid"] != rel["head"] else "")
+        if why:
+            if live.get("state") == "OPEN":
+                run(["gh", "pr", "close", str(rel["pr"]), "-R", repo, "--delete-branch", "--comment",
+                     f"Abandoned: {why}. The next ship builds a new release from what has passed."])
+            data.pop("release", None)
+            lead0 = (rel.get("issues") or [None])[0]
+            if lead0:
+                data.pop(lead0, None)
+                (data.get("branches") or {}).pop(lead0, None)
+            save()
+            if not args.json:
+                print(f"{INFO} Release PR #{rel['pr']} dropped ({why}); building a new one from what has passed.", flush=True)
+            rel = None
+        elif live.get("state") == "MERGED" and manual:
+            # Merged, waiting for the owner's deploy: it no longer holds up the next release.
+            data.setdefault("awaiting_live", []).append(rel)
+            data.pop("release", None)
+            save()
+            rel = None
+    elif rel and args.plan:         # read only: a merged release waiting for its deploy doesn't hold up the plan
+        c_v, o_v, _ = run(["gh", "pr", "view", str(rel["pr"]), "-R", repo, "--json", "state"])
+        if (json.loads(o_v) if c_v == 0 and o_v else {}).get("state") == "MERGED" and manual:
+            data.setdefault("awaiting_live", []).append(rel)
+            rel = None
+    awaiting = data.get("awaiting_live") or []
+
+    if args.live and awaiting and not rel and not args.plan:
+        # The owner deployed and said it's live: close every release the deployed commit contains.
+        run(["git", "fetch", "--quiet", "origin"], cwd=root)
+        deployed = args.deployed or git_out(root, "rev-parse", f"origin/{cfg.get('default_branch') or 'main'}")
+        closed, waiting, failed, cache = [], [], [], {}
+        for r in list(awaiting):
+            m = release_merge_commit(repo, r)
+            if not m or not commit_contains(repo, m, deployed, cache):
+                waiting.append(r)
+                continue
+            c5, o5, e5 = run(me + ["ship", r["issues"][0].lstrip("#"), "--human", "--release-pr", "--pr-number",
+                                   str(r["pr"]), "--live"], cwd=root)
+            if not args.json:
+                print(o5 + (e5 or ""), end="")
+            if c5 == 0:
+                forget_release(repo, data, r)
+                closed.append(r)
+            else:
+                failed.append(r)
+                waiting.append(r)
+        data["awaiting_live"] = waiting
+        if not waiting:
+            data.pop("awaiting_live", None)
+        save()
+        msg = (f"Live: release PR{'s' if len(closed) > 1 else ''} " + ", ".join(f"#{r['pr']}" for r in closed) + "."
+               if closed else "No release was closed.")
+        rest = [r for r in waiting if r not in failed]
+        if rest:
+            msg += (" Not in the deployed commit, still waiting: " + ", ".join(f"#{r['pr']}" for r in rest)
+                    + ". Deploy again, then say it's live.")
+        if failed:
+            msg += " Couldn't close " + ", ".join(f"#{r['pr']}" for r in failed) + ": run the same command again."
+        return result("live" if closed and not failed else "stopped", 0 if closed and not failed else 1, msg)
+
+    if not rel:
+        vitems, vleft = verified_release_items(root, cfg, data, args)
+        items = release_order(release_items(args, cfg, data) + vitems,
+                              [show_ref(issue_ref(cfg, x)) for x in (getattr(args, "first", None) or [])])
+        if args.plan:
+            if not items:
+                return result("nothing to ship", 0, f"{INFO} Nothing has passed since the last release."
+                              + (" Waiting for the deploy of " + ", ".join(f"release PR #{r['pr']}" for r in awaiting)
+                                 if awaiting else ""))
+            try:
+                comp = release_composition(root, cfg, items, [show_ref(issue_ref(cfg, x)) for x in (args.first or [])])
+            except RuntimeError as e:
+                out("stopped", 1, str(e))
+            comp["left_out"] += vleft
+            print_release_plan(comp, args, awaiting)
+            args._release_result = None
+            return 3 if comp["clashes"] else 0
+        if not items:
+            if awaiting:
+                names = ", ".join(f"release PR #{r['pr']} ({', '.join(r['issues'])})" for r in awaiting)
+                return result("deploy by hand", SHIP_WAITING_HUMAN,
+                              f"Nothing new has passed. Merged and waiting for the deploy: {names}. Deploy it your "
+                              "usual way, then say it's live (ship --all --human --live).")
+            return result("nothing to ship", 0, f"{INFO} Nothing has passed since the last release.")
+        try:
+            comp = release_composition(root, cfg, items, [show_ref(issue_ref(cfg, x)) for x in (args.first or [])],
+                                       keep=True)
+        except RuntimeError as e:
+            out("stopped", 1, str(e))
+        wt = comp["wt"]
+        included, skipped = comp["included"], [f"{x['key']}: {x['why']}" for x in comp["left_out"] + vleft]
+        try:
+            if comp["clashes"]:
+                out("stopped", 1, "Two passed changes clash, so nothing was built: the owner says which goes first. "
+                    + " ".join(clash_question(comp["clashes"])) + " (`ship --plan` shows the whole release.)")
+            if not included:
+                out("stopped", 1, "Nothing could go into the release. " + " ".join(skipped))
+            head = comp["head"]
+            name = f"release/{time.strftime('%Y%m%d-%H%M%S')}"
+            c3, _, e3 = run(["git", "push", "--quiet", "origin", f"HEAD:refs/heads/{name}"], cwd=wt)
+            if c3 != 0:
+                out("stopped", 1, f"Couldn't push the release branch: {e3[:200]}")
+        finally:
+            run(["git", "worktree", "remove", "--force", str(wt)], cwd=root)
+        base = comp["base"]
+        _, main, _ = git_paths(root)
+        ids, labels = [], ["uat-passed"]
+        for _, v in included:
+            ids += [i for i in v["issues"] if i not in ids]
+            labels += [l for l in v.get("labels") or [] if l not in labels]
+        who = gh_login() or "the owner"
+        any_verified = any(v.get("verified") for _, v in included)
+        gh_api("POST", f"repos/{repo}/statuses/{head}", {"state": "success", "context": "uat",
+               "description": (f"Release shipped by @{who}: each change passed by them or verified by agents"
+                               if any_verified else f"Release of changes each passed by @{who}")[:140]})
+        body = ("\n".join(f"Refs {i}" for i in ids) + "\n\n## Release\nEach change was "
+                + ("tested and passed by the owner, or verified by an independent agent (`uat: agents-verify`), "
+                   if any_verified else "tested and passed on its own ")
+                + "before going in (HAAM release grouping), in issue-number order; the checks and the AI reviews run "
+                "once, on the whole release, and it merges on the owner's `ship`.\n\n"
+                "| Change | Commit | How it was checked |\n|---|---|---|\n"
+                + "".join(f"| {' '.join(v['issues'])}: {v['title']} | `{v['sha'][:8]}` | {how_checked(v)} |\n"
+                          for _, v in included)
+                + (("\n" + "\n".join(f"- Not in this release: {s}" for s in skipped) + "\n") if skipped else "")
+                + (f"\nProtected areas: {', '.join(comp['protected'][:30])}\n" if comp["protected"] else "")
+                + (f"\nLooks like database migrations: {', '.join(comp['migrations'][:30])}\n" if comp["migrations"] else ""))
+        f = main / ".haam" / "pr-release.md"
+        f.write_text(body)
+        cmd = ["gh", "pr", "create", "-R", repo, "--head", name, "--base", base, "--title",
+               f"{' '.join(ids)}: Release {time.strftime('%Y-%m-%d')}", "--body-file", str(f)]
+        for lab in labels:
+            cmd += ["--label", lab]
+        c4, o4, e4 = run(cmd)
+        f.unlink()
+        if c4 != 0:
+            out("stopped", 1, f"Couldn't open the release PR: {(e4 or o4)[:200]}")
+        url = o4.strip().splitlines()[-1] if o4 else ""
+        rel = {"pr": int(url.rstrip("/").rsplit("/", 1)[-1]), "branch": name, "head": head, "issues": ids,
+               "included": {k: v for k, v in included}}
+        data = json.loads(tf.read_text()) if tf.exists() else {}
+        data[ids[0]] = head                              # ship merges exactly this combination
+        data.setdefault("branches", {})[ids[0]] = name
+        data["release"] = rel
+        save()
+        if not args.json:
+            print(f"{OK} Release PR opened with {', '.join(ids)}: {url}", flush=True)
+            for sk in skipped:
+                print(f"{WARN} Not in this release: {sk}", flush=True)
+    elif args.plan:
+        return result("release open", 0, f"{INFO} Release PR #{rel['pr']} ({', '.join(rel['issues'])}) is open; ship "
+                      "carries on with it. Nothing else is planned until it merges.")
+    elif not args.json:
+        print(f"{INFO} Carrying on with release PR #{rel['pr']} ({', '.join(rel['issues'])})", flush=True)
+    lead = rel["issues"][0]
+    extra = (["--live"] if args.live else []) + (["--no-deploy"] if args.no_deploy else [])
+    c5, o5, e5 = run(me + ["ship", lead.lstrip("#"), "--human", "--release-pr", "--pr-number", str(rel["pr"]),
+                           "--wait", str(args.wait)] + extra + (["--json"] if args.json else []), cwd=root)
+    if args.json:
+        try:
+            args._release_result = json.loads(o5)
+        except (json.JSONDecodeError, TypeError):
+            args._release_result = {"ok": False, "message": (e5 or o5 or "")[:300]}
+    else:
+        print(o5 + (e5 or ""), end="")
+        if c5 == 1:
+            print(f"{INFO} If a release check failed: send the change it's about back (its /test fail), then "
+                  "`ship --all --human --abandon-release` builds a new release without it.", flush=True)
+    data = json.loads(tf.read_text()) if tf.exists() else {}
+    if c5 == 0:     # released
+        forget_release(repo, data, data.pop("release", {}) or rel)
+        save()
+    elif c5 == SHIP_WAITING_HUMAN and manual:
+        # Merged: it waits for the owner's deploy, and the next ship may build the next release meanwhile.
+        cur = data.pop("release", None) or rel
+        data.setdefault("awaiting_live", []).append(cur)
+        save()
+        if len(data["awaiting_live"]) > 1 and not args.json:
+            print(f"{INFO} Waiting for the deploy: " + ", ".join(f"release PR #{r['pr']}" for r in data["awaiting_live"])
+                  + ". One deploy of main carries them all; then `ship --all --human --live` closes every one.",
+                  flush=True)
+    return c5
+
+
+def ship_batch(args, root, cfg):
+    """Ship several changes with one production deploy: merge each (when its checks pass), approve only the newest
+    deploy run (it carries all of them; older waiting runs are cancelled), then close every issue.
+    Safe to run again; exit codes as for one issue."""
+    if setting_value(cfg, "grouping") == "release" and not getattr(args, "_release_done", False):
+        code = ship_release(args, root, cfg)
+        if args.plan:
+            sys.exit(code)
+        others = []
+        if code == 0 and args.all and cfg.get("tracker") == "github":
+            try:
+                others = ship_candidates(cfg, cfg["github_repo"])
+            except RuntimeError:
+                others = []
+        if not others:
+            if args.json:
+                print(json.dumps(getattr(args, "_release_result", {"ok": code == 0}), indent=2))
+            sys.exit(code)
+        # --all: then anything else that's ready on its own (no-UAT PRs, overrides) ships the usual way
+        args._release_done = True
+    repo = cfg["github_repo"]
+    deadline = time.time() + args.wait * 60
+    out_steps, merged, stopped, pending = [], [], [], []
+
+    def say(msg):
+        out_steps.append(msg)
+        if not args.json:
+            print(msg, flush=True)
+
+    def finish(state, code, message):
+        if args.json:
+            print(json.dumps({"ok": code == 0, "state": state, "message": message, "merged": [m["issue"] for m in merged],
+                              "stopped": stopped, "pending": pending, "steps": out_steps,
+                              **({"release": args._release_result} if getattr(args, "_release_result", None) else {})},
+                             indent=2))
+        elif message:
+            print(message, flush=True)
+        sys.exit(code)
+
+    refs = [issue_ref(cfg, x) for x in (args.issue or [])]
+    if args.all and cfg.get("tracker") != "github":
+        finish("stopped", 1, "--all needs GitHub Projects (it reads the board). On Linear, list the issues: "
+               "ship APP-12 APP-13 --human")
+    if args.all:
+        try:
+            refs += [r for r in ship_candidates(cfg, repo) if r not in refs]
+        except RuntimeError as e:
+            finish("stopped", 1, f"Couldn't list what's ready: {e}")
+    if not refs:
+        finish("nothing to ship", 0, "Nothing is ready to ship: no PR has passed UAT or is in the no-UAT lane.")
+    if args.plan:       # one PR per change: each merges on its own checks; this only lists them, in order
+        refs = sorted(refs, key=lambda r: issue_number_key(show_ref(r)))
+        finish("plan", 0, "Would ship, in this order (each PR merges on its own checks): "
+               + ", ".join(show_ref(r) for r in refs) + ". Nothing was merged.")
+    say(f"{INFO} Shipping together: " + ", ".join(show_ref(r) for r in refs))
+    me = [sys.executable, str(Path(__file__).resolve())]
+    for r in refs:
+        left = max(0.0, (deadline - time.time()) / 60)
+        c, o, e = run(me + ["ship", str(r), "--human", "--merge-only", "--json", "--wait", f"{left:.2f}"]
+                      + (["--merged-only"] if args.merged_only else []), cwd=root)
+        try:
+            res = json.loads(o)
+        except (json.JSONDecodeError, TypeError):
+            res = {"message": (e or o or "")[:300]}
+        if c == 0:
+            merged.append({"issue": show_ref(r), "ref": r, "sha": res.get("sha"), "docs_only": res.get("docs_only"),
+                           "merged_at": res.get("merged_at") or ""})
+            say(f"{OK} {show_ref(r)}: merged")
+        elif c == SHIP_NOT_FINISHED:
+            pending.append(show_ref(r))
+            say(f"{INFO} {show_ref(r)}: checks still running")
+        else:
+            stopped.append({"issue": show_ref(r), "why": res.get("message", "")})
+            say(f"{BAD} {show_ref(r)}: {res.get('message', '')}")
+    if pending:
+        finish("waiting for checks", SHIP_NOT_FINISHED, "Not finished yet: " + ", ".join(pending) + " still have checks "
+               "running. Nothing is deployed until they're merged too, so it's one deploy. Run the same command again.")
+    if not merged:
+        finish("stopped", 1, "Nothing was merged. " + " ".join(f"{s['issue']}: {s['why']}" for s in stopped))
+
+    # One deploy for all of them: the newest deploy run among the merges carries every change.
+    shas = [m["sha"] for m in merged if m.get("sha") and not m.get("docs_only")]   # in merge order
+    run_url = None
+    if cfg.get("deploy") == "manual" and not args.live:
+        finish("deploy by hand", SHIP_WAITING_HUMAN, "Merged " + ", ".join(m["issue"] for m in merged) + ". Waiting for "
+               "the human: deploy it your usual way, then say it's live (run this again with --live).")
+    deployed = None
+    if shas and not args.live and not args.no_deploy:
+        # The newest of the merges on the default branch (the batch may include changes merged earlier).
+        cm, commits, _ = gh_api("GET", f"repos/{repo}/commits?sha={cfg.get('default_branch') or 'main'}&per_page=100")
+        order = [x.get("sha") for x in commits] if cm == 0 and isinstance(commits, list) else []
+        last = next((x for x in order if x in shas), shas[-1])
+        shas = [x for x in shas if x != last] + [last]
+        from datetime import datetime, timezone
+        ages = []
+        for m in merged:
+            try:
+                ages.append((datetime.now(timezone.utc)
+                             - datetime.fromisoformat(m["merged_at"].replace("Z", "+00:00"))).total_seconds())
+            except ValueError:
+                ages.append(0)
+        outcome, info_, deployed = await_deploy(repo, args.workflow, shas, deadline, say, min(ages or [0]),
+                                                cfg.get("default_branch") or "main")
+        if outcome == "failed":
+            finish("deploy failed", 1, f"The deploy failed: {info_}. Show the human; report it as an Urgent bug "
+                   "if production is affected.")
+        if outcome == "later":
+            finish("deploying", SHIP_NOT_FINISHED, f"Not finished yet: {info_} Run the same command again.")
+        if outcome == "stop":
+            finish("stopped", 1, info_)
+        run_url = info_
+    # Close each issue (the deploy is done, or nothing needed deploying)
+    not_closed = []
+    for m in merged:
+        extra = ["--released-in", run_url] if run_url else (["--live"] if args.live else ["--no-deploy"])
+        c, o, e = run(me + ["ship", str(m["ref"]), "--human", "--json"] + extra, cwd=root)
+        if c == 0:
+            say(f"{OK} {m['issue']} is live and Done")
+        else:
+            not_closed.append(m["issue"])
+            say(f"{WARN} {m['issue']}: couldn't close it ({(e or o)[:160]})")
+    if deployed:
+        close_released(cfg, repo, deployed, run_url, {m["ref"] for m in merged}, say)
+    tidy_worktrees(root, cfg, say)
+    msg = ", ".join(m["issue"] for m in merged) + " " + ("are" if len(merged) > 1 else "is") + " live."
+    if not_closed:
+        msg += " Couldn't close " + ", ".join(not_closed) + ": run the same command again, or /release them."
+    if stopped:
+        msg += " Not shipped: " + "; ".join(f"{s['issue']}: {s['why']}" for s in stopped)
+    finish("live", 0 if not stopped and not not_closed else 1, msg)
+
+
+def cmd_ship(args):
+    """After the human passed UAT and said 'ship': merge, approve the production deploy, wait, close the issue.
+    Safe to run again: it carries on from wherever the last run stopped.
+    Exit codes: 0 live, 2 not finished yet (run again), 3 waiting for the human to deploy by hand, 1 stopped."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    if args.plan:       # shows what ship would do, and does nothing else
+        if args.release_pr or args.merge_only or args.merged_only or args.live:
+            sys.exit("--plan shows what `ship --all` (or `ship <IDs>`) would do; give it nothing else.")
+    elif not args.human:
+        sys.exit("Shipping is the human's decision. Run it only inside /test (after the human said 'pass' and "
+                 "'ship') or /release (with --merged-only), and add --human.")
+    if git_paths(root)[2] and not args.plan:
+        sys.exit("ship runs only from the owner's own chat in the main project folder, never from an agent's worktree.")
+    issues = args.issue or []
+    release = (setting_value(cfg, "grouping") == "release" and not args.release_pr and not args.merge_only
+               and not args.released_in and not args.merged_only)
+    if args.all or len(issues) > 1 or release or args.plan:
+        return ship_batch(args, root, cfg)
+    if not issues:
+        sys.exit("Give the issue (ship 12), several (ship 12 13 14), or --all")
+    args.issue = issues[0]
+    ref = issue_ref(cfg, args.issue)
+    repo = cfg["github_repo"]
+    deadline = time.time() + args.wait * 60
+    steps = []
+
+    def say(msg):
+        steps.append(msg)
+        if not args.json:
+            print(msg, flush=True)
+
+    def finish(state, code=0, message="", **extra):
+        if args.json:
+            print(json.dumps({"ok": code == 0, "issue": show_ref(ref), "state": state, "message": message,
+                              "steps": steps, **extra}, indent=2))
+        elif message:
+            print(message, flush=True)
+        sys.exit(code)
+
+    def stop(message):
+        say(f"{BAD} {message}")
+        finish("stopped", 1, "Stopped: this needs the human. " + message)
+
+    def later(state, message):
+        finish(state, SHIP_NOT_FINISHED, f"Not finished yet ({state}). {message} Run the same command again.")
+
+    try:
+        if args.pr_number:            # the release PR, by number (its title names issues that have older PRs too)
+            c_p, o_p, _ = run(["gh", "pr", "view", str(args.pr_number), "-R", repo,
+                               "--json", "number,title,headRefName,state,labels,url,isDraft"])
+            pr = json.loads(o_p) if c_p == 0 and o_p else None
+        else:
+            pr = find_pr(cfg, ref)
+    except RuntimeError as e:
+        stop(str(e))
+    if not pr:
+        stop(f"No pull request found for {show_ref(ref)}.")
+    num = str(pr["number"])
+    labels = [l["name"] for l in pr.get("labels") or []]
+
+    # 1. Merge (only from /test, after pass + ship)
+    if pr["state"] == "OPEN":
+        if args.merged_only:
+            stop(f"PR #{num} isn't merged yet. Use /test, so the human tests it and says 'ship'.")
+        if pr.get("isDraft"):
+            stop(f"PR #{num} is still a draft.")
+        sha = tested_sha(root, ref)
+        lane = "uat:skip" in labels and "human-review" not in labels and "uat-passed" not in labels
+        if lane:
+            say(f"{INFO} No-UAT lane (uat:skip): merging once the checks, the reviews and the gate pass")
+            sha = None      # nothing was tested by hand: the checks decide, on whatever the head is
+        elif "uat-passed" not in labels and "gate-override" not in labels:
+            # The gate drops the label when a push races it; the `uat` status on the tested head is the owner's pass.
+            if not (sha and pr_head(repo, num) == sha and uat_status_ok(repo, sha)):
+                stop(f"PR #{num} hasn't passed UAT (no 'uat-passed' label). Record the human's test result first.")
+            run(["gh", "pr", "edit", num, "-R", repo, "--add-label", "uat-passed"])
+            labels.append("uat-passed")
+            say(f"{INFO} Put back 'uat-passed': the owner's pass is recorded on this exact commit")
+        if not sha and not lane:
+            say(f"{WARN} No record of which commit the human tested (they didn't use checkout-pr); merging the current head")
+        if setting_value(cfg, "ci") == "local":
+            head0 = pr_head(repo, num)
+            if head0 and not status_ok(repo, head0, "ci-local"):
+                # ci = local: the check runs here, on the owner's computer, before anything merges.
+                say(f"{INFO} Running make check on this computer (setting ci: local)…")
+                c_l, o_l, e_l = run([sys.executable, str(Path(__file__).resolve()), "local-ci", "--pr", num], cwd=root)
+                if c_l != 0:
+                    stop(f"make check failed on this computer for PR #{num} (ci-local): send it back to an agent. "
+                         + ((e_l or o_l or "").strip().splitlines() or [""])[-1][:160])
+                say(f"{OK} make check passed here (ci-local)")
+        said_waiting = False
+        started = time.time()
+        while True:
+            try:
+                checks = pr_checks(repo, num)
+            except RuntimeError as e:
+                stop(str(e))
+            passed, pending, failed = checks or ([], [], [])
+            # Checks take a moment to start on a just-opened PR, and the gate a moment to re-run after a label
+            # change. Measured from the PR's last update, so running ship again doesn't restart the clock.
+            age = pr_quiet_seconds(repo, num)
+            settling = (time.time() - started if age is None else age) < checks_grace_seconds()
+            if settling and "release-gate" in failed and ("uat-passed" in labels or lane):
+                failed = [c for c in failed if c != "release-gate"]
+                pending = pending + ["release-gate (re-checking)"]
+            if failed:
+                stop(f"Checks failing on PR #{num}: {', '.join(failed)}. Send it back to an agent.")
+            if "release-gate" not in passed and "release-gate" not in pending:
+                if settling:
+                    pending = pending + ["release-gate (starting)"]
+                elif checks is None:
+                    stop(f"No checks have started on PR #{num}. Check that GitHub Actions is on for this repository.")
+                else:
+                    stop(f"PR #{num} has no 'release-gate' check. The UAT gate isn't set up (haam.py github --apply).")
+            if not pending:
+                head = pr_head(repo, num)
+                if sha and head and head != sha:
+                    stop(f"PR #{num} changed after the human tested it. Test it again with /test.")
+                pin = sha or (head if lane else None)     # the lane: merge exactly the head the checks passed on
+                cmd = ["gh", "pr", "merge", num, "-R", repo, "--squash"] + (["--match-head-commit", pin] if pin else [])
+                code, out, err = run(cmd)
+                if code == 0:
+                    say(f"{OK} Merged PR #{num}")
+                    break
+                msg = (err or out)[:300]
+                code2, out2, _ = run(["gh", "pr", "view", num, "-R", repo, "--json", "mergeStateStatus"])
+                mstate = (json.loads(out2).get("mergeStateStatus") if code2 == 0 and out2 else "") or ""
+                if mstate == "DIRTY":
+                    stop(f"PR #{num} has merge conflicts with main. Send it back to an agent to rebase.")
+                if mstate not in ("BLOCKED", "UNKNOWN", "UNSTABLE", ""):
+                    stop(f"GitHub refused the merge: {msg}")
+                if mstate == "BLOCKED" and not pending:
+                    stop(f"GitHub is blocking the merge (a required review or another rule): {msg}")
+            if time.time() > deadline:
+                later("waiting for checks", f"Checks still running on PR #{num}: {', '.join(pending) or 'starting'}.")
+            if not said_waiting:
+                say(f"{INFO} Waiting for the checks to finish before merging…")
+                said_waiting = True
+            time.sleep(poll_seconds())
+        gh_api("DELETE", f"repos/{repo}/git/refs/heads/{pr['headRefName']}")
+
+    code, out, err = run(["gh", "pr", "view", num, "-R", repo, "--json", "state,mergeCommit,mergedAt,files,url"])
+    view = json.loads(out) if code == 0 and out else {}
+    sha = (view.get("mergeCommit") or {}).get("oid")
+    if view.get("state") != "MERGED" or not sha:
+        stop(f"PR #{num} isn't merged (state {view.get('state') or pr['state']}).")
+    files = [f.get("path", "") for f in view.get("files") or []]
+    docs_only = bool(files) and all(p.startswith("docs/") or p.endswith(".md") for p in files)
+
+    board = None
+    if cfg.get("tracker") == "github":
+        board = GHProject(cfg)
+        board.load()
+        iss = board.issue(ref)
+        if iss["status"] not in ("Deploying", "Done"):
+            board.set_option(iss, "Status", "Deploying")
+    if args.merge_only:       # a batch: ship_batch deploys once for all of them, then closes each
+        finish("merged", 0, f"PR #{num} is merged.", sha=sha, docs_only=docs_only, pr=int(num),
+               merged_at=view.get("mergedAt") or "")
+
+    # 2. Deploy: approve the production environment and wait
+    run_info = None
+    manual = cfg.get("deploy") == "manual"
+    if args.released_in:
+        run_info = {"url": args.released_in}
+        say(f"{OK} Deployed with the batch: {args.released_in}")
+    elif args.no_deploy or args.live:
+        say(f"{INFO} The human confirmed it's live")
+    elif manual:
+        say(f"{INFO} Merged. This project deploys by hand")
+        finish("deploy by hand", SHIP_WAITING_HUMAN, "Waiting for the human: deploy it your usual way, then say it's live "
+               "(the agent runs this again with --live to close the issue).")
+    elif docs_only:
+        say(f"{INFO} Docs-only change: nothing to deploy")
+    else:
+        merged_at = view.get("mergedAt") or ""
+        try:
+            from datetime import datetime, timezone
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(merged_at.replace("Z", "+00:00"))).total_seconds()
+        except ValueError:
+            age = 0
+        outcome, info_, deployed = await_deploy(repo, args.workflow, [sha], deadline, say, age,
+                                                cfg.get("default_branch") or "main")
+        if outcome == "failed":
+            finish("deploy failed", 1, "The deploy failed. Show the human the run; report it as an Urgent bug "
+                   "if production is affected.", run=info_)
+        if outcome == "later":
+            later("deploying", info_)
+        if outcome == "stop":
+            stop(info_)
+        run_info = {"url": info_, "headSha": deployed}
+
+    # 3. Close the issue(s) (once). A batch PR ('#12 #13: …') closes every issue it names.
+    where = f" · deploy run {run_info['url']}" if run_info else ""
+    others = [r for r in pr_title_issues(pr) if isinstance(r, type(ref)) and r != ref]
+    for extra in others:
+        if board:
+            e = board.issue(extra)
+            if e["state"] == "OPEN":
+                board.set_option(e, "Status", "Done")
+                run(["gh", "issue", "comment", str(extra), "-R", repo, "--body", f"🚀 Released to production with #{ref}{where}"])
+                run(["gh", "issue", "close", str(extra), "-R", repo, "--reason", "completed"])
+                say(f"{OK} #{extra} is live and Done (same PR)")
+        else:
+            say(f"{INFO} Also set {show_ref(extra)} to Done in Linear (same PR)")
+    if board:
+        iss = board.issue(ref)
+        if iss["status"] != "Done" or iss["state"] == "OPEN":
+            board.set_option(iss, "Status", "Done")
+            run(["gh", "issue", "comment", str(ref), "-R", repo, "--body", f"🚀 Released to production{where}"])
+            if iss["state"] == "OPEN":
+                run(["gh", "issue", "close", str(ref), "-R", repo, "--reason", "completed"])
+        say(f"{OK} {show_ref(ref)} is live and Done")
+        if iss.get("parent"):
+            _, subs = board.sub_issues(iss["parent"])
+            if subs and all(k["state"] == "CLOSED" or k["number"] == ref for k in subs):
+                say(f"{INFO} That was the last open issue in epic #{iss['parent']}. Close the epic too if the human agrees: "
+                    f"issue close {iss['parent']} --human")
+    else:
+        say(f"{INFO} Now set {show_ref(ref)} to Done in Linear and comment: Released to production{where}")
+    if run_info and run_info.get("headSha") and not args.released_in:
+        close_released(cfg, repo, run_info["headSha"], run_info["url"], {ref, *others}, say)
+    tf = tested_file(root)
+    if tf.exists():
+        data = json.loads(tf.read_text())
+        data.pop(show_ref(ref), None)
+        (data.get("branches") or {}).pop(show_ref(ref), None)
+        tf.write_text(json.dumps(data, indent=2) + "\n")
+    if not args.released_in:
+        tidy_worktrees(root, cfg, say)
+    finish("live", 0, f"{show_ref(ref)} is live.", run=run_info["url"] if run_info else None)
+
+
+def limits_config(root):
+    """The limits come from the main folder's default-branch copy of haam.config.json (`main` / `origin/main`),
+    so a feature branch checked out there during `/test` doesn't silently lower them. A batch window or limit
+    just written in that folder's working tree still counts when the folder is on the default branch, so a
+    settings change takes effect for every agent chat before it's committed."""
+    _, main, _ = git_paths(root)
+    wt = None
+    try:
+        wt = load_config(main)
+    except SystemExit:
+        pass
+    base = (wt or {}).get("default_branch") or "main"
+    cfg = None
+    for spec in (f"{base}:{CONFIG_NAME}", f"origin/{base}:{CONFIG_NAME}"):
+        raw = git_out(main, "show", spec)
+        if not raw:
+            continue
+        try:
+            cfg = json.loads(raw)
+            break
+        except json.JSONDecodeError:
+            continue
+    if cfg is None:
+        if wt is not None:
+            return wt
+        return load_config(root)
+    branch = (git_out(main, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()
+    if wt is not None and branch in (base, "HEAD"):
+        for k in ("max_open_prs", "max_in_uat", "batch_window"):
+            if k in wt:
+                cfg[k] = wt[k]
+    return cfg
+
+
+def effective_limits(cfg, today=None, now=None):
+    """(max_open_prs, max_in_uat, window): a settings window open on this computer, or the committed batch window's
+    raise until its last day, then the normal limits."""
+    max_prs = int(cfg.get("max_open_prs") or DEFAULT_CONFIG["max_open_prs"])
+    max_uat = int(cfg.get("max_in_uat") or DEFAULT_CONFIG["max_in_uat"])
+    w = cfg.get("batch_window") or {}
+    window = None
+    try:
+        until = datetime.date.fromisoformat(str(w.get("until")))
+    except ValueError:
+        until = None
+    if until and (today or datetime.date.today()) <= until:
+        max_prs, max_uat, window = int(w.get("max_open_prs") or max_prs), int(w.get("max_in_uat") or max_uat), dict(w)
+    machine = {k: v for k, v in active_windows(now=now).items() if k in ("max_open_prs", "max_in_uat")}
+    if machine:
+        window = dict(window or {})
+        ends = [v["until"] for v in machine.values()] + ([window["until"]] if window.get("until") else [])
+        window.update({k: v["value"] for k, v in machine.items()})
+        window["until"] = min(ends, key=lambda u: window_end(u) or datetime.datetime.max)
+        max_prs, max_uat = int(window.get("max_open_prs") or max_prs), int(window.get("max_in_uat") or max_uat)
+    return max_prs, max_uat, window
+
+
+# A settings window: a temporary value for a limit that counts at once for every chat on this computer (all worktrees
+# share the common git directory, where the file lives next to the machine lock) and ends by itself. It never touches
+# haam.config.json, so it works while the main folder has a branch checked out for a test.
+SETTINGS_WINDOW_FILE = "haam-settings-window.json"
+WINDOW_SETTINGS = ("max_open_prs", "max_in_uat", "max_review_rounds", "max_pr_lines")
+_COMMON_DIRS = {}
+
+
+def settings_window_path(cwd=None):
+    """`<common git dir>/haam-settings-window.json`, or None outside a git repository."""
+    cwd = Path(cwd or Path.cwd())
+    key = str(cwd)
+    if key not in _COMMON_DIRS:
+        common = git_out(cwd, "rev-parse", "--git-common-dir")
+        _COMMON_DIRS[key] = (cwd / common).resolve() if common else None
+    return _COMMON_DIRS[key] / SETTINGS_WINDOW_FILE if _COMMON_DIRS[key] else None
+
+
+def window_end(until):
+    """The local time a window ends: a day means the end of that day; a date and time, that moment."""
+    s = str(until or "").strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            return datetime.datetime.combine(datetime.date.fromisoformat(s), datetime.time.max)
+        end = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return end.astimezone().replace(tzinfo=None) if end.tzinfo else end
+
+
+def parse_window_until(until):
+    """--until as stored: 'YYYY-MM-DD' (to the end of that day) or 'YYYY-MM-DDTHH:MM', local time; refuses the past."""
+    s = str(until or "").strip()
+    end = window_end(s)
+    if end is None:
+        sys.exit(f"--until takes the last day (YYYY-MM-DD) or a moment (YYYY-MM-DDTHH:MM, local time), not '{until}'")
+    if end < datetime.datetime.now():
+        sys.exit(f"{until} is in the past")
+    return s if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s) else end.isoformat(timespec="minutes")
+
+
+def active_windows(cwd=None, now=None):
+    """{key: {value, until, set_at}} for the windows on this computer that haven't ended yet."""
+    p = settings_window_path(cwd)
+    if not p or not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+    now = now or datetime.datetime.now()
+    out = {}
+    for k, w in (data.items() if isinstance(data, dict) else []):
+        end = window_end(w.get("until")) if isinstance(w, dict) else None
+        if k in WINDOW_SETTINGS and end and end >= now and isinstance(w.get("value"), int):
+            out[k] = w
+    return out
+
+
+def change_windows(cwd, opened=None, until=None, cleared=()):
+    """Open windows ({key: value} until `until`) and end others early; drops the ended ones. Returns what's active."""
+    p = settings_window_path(cwd)
+    if not p:
+        sys.exit("A settings window lives in the project's git repository: run this inside it.")
+    data = active_windows(cwd)
+    for k in cleared:
+        data.pop(k, None)
+    stamp = datetime.datetime.now().isoformat(timespec="minutes")
+    for k, v in (opened or {}).items():
+        data[k] = {"value": v, "until": until, "set_at": stamp}
+    if data:
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.replace(str(tmp), str(p))
+    elif p.exists():
+        p.unlink()
+    return data
+
+
+def window_line(key, w):
+    return f"{key} {w['value']} until {w['until']}"
+
+
+def open_limit_windows(root, limits, until):
+    """`--until` with the limits: a window on this computer (haam.config.json keeps the normal limits)."""
+    if not limits:
+        sys.exit("--until goes with the limits to raise, e.g. settings --set max_in_uat=30 --until 2026-10-27 --human")
+    other = [k for k in limits if k not in WINDOW_SETTINGS]
+    if other:
+        sys.exit(f"--until opens a temporary window only for the limits ({', '.join(WINDOW_SETTINGS)}); "
+                 f"{', '.join(other)} {'is a lasting choice' if len(other) == 1 else 'are lasting choices'}: "
+                 "set it without --until.")
+    return change_windows(root, limits, parse_window_until(until))
+
+
+def docs_only(files):
+    """Only docs/** and *.md, as the release gate counts it (an empty or 100-file list doesn't count)."""
+    paths = [f.get("path") or "" for f in files or []]
+    return bool(paths) and len(paths) < 100 and all(x.startswith("docs/") or x.endswith(".md") for x in paths)
+
+
+def cmd_capacity(args):
+    """Whether agents should start new work: open PRs and changes waiting in UAT against the limits in haam.config.json."""
+    root = find_repo_root(Path.cwd())
+    cfg = limits_config(root)
+    max_prs, max_uat, window = effective_limits(cfg)
+    code, out, err = run(["gh", "pr", "list", "-R", cfg.get("github_repo") or "", "--state", "open", "--limit", "200",
+                          "--json", "number,title,isDraft,author,files"])
+    if code != 0:
+        sys.exit(f"Couldn't count open pull requests: {(err or out)[:200]}")
+    # Bots' PRs (Dependabot…) cost CI too, but they shouldn't stop the agents' own work.
+    mine = [p for p in json.loads(out or "[]")
+            if not ((p.get("author") or {}).get("login", "").endswith("[bot]") or (p.get("author") or {}).get("is_bot"))]
+    # Only ready PRs cost CI on every push and wait on a human. Drafts run nothing; docs-only PRs (epic briefs, split
+    # specs, ADRs, assessments) run nothing and need no test. They're listed, but never hold work.
+    docs_prs = [p for p in mine if docs_only(p.get("files"))]
+    drafts = [p for p in mine if p.get("isDraft") and p not in docs_prs]
+    counted = [p for p in mine if p not in docs_prs and p not in drafts]
+    open_prs = len(counted)
+    uat_items = []
+    in_uat = args.in_uat     # Linear: the agent counts the UAT items with the Linear connection and passes them
+    if in_uat is None and cfg.get("tracker") == "github":
+        try:
+            board = GHProject(cfg)
+            board.load()
+            uat_items = [i for i in board.items() if i["status"] == "UAT" and i["state"] == "OPEN"]
+            in_uat = len(uat_items)
+        except RuntimeError:
+            in_uat = None
+    reasons = []
+    if open_prs >= max_prs:
+        reasons.append(f"{open_prs} ready PRs (limit {max_prs})")
+    if in_uat is not None and in_uat >= max_uat:
+        reasons.append(f"{in_uat} changes waiting for the owner to test (limit {max_uat})")
+    if in_uat is None:
+        reasons_note = "UAT queue not counted (Linear: count the UAT items and pass --in-uat N)"
+    else:
+        reasons_note = ""
+    brief = lambda ps: [{"number": p["number"], "title": p.get("title", ""), "draft": bool(p.get("isDraft"))} for p in ps]
+    res = {"hold": bool(reasons), "open_prs": open_prs, "max_open_prs": max_prs, "in_uat": in_uat,
+           "max_in_uat": max_uat, "reasons": reasons, "note": reasons_note, "batch_window": window,
+           "normal_limits": {"max_open_prs": int(cfg.get("max_open_prs") or DEFAULT_CONFIG["max_open_prs"]),
+                             "max_in_uat": int(cfg.get("max_in_uat") or DEFAULT_CONFIG["max_in_uat"])},
+           "counted_prs": brief(counted), "draft_prs": brief(drafts), "docs_prs": brief(docs_prs),
+           "uat_issues": [{"number": i["number"], "title": i.get("title", "")} for i in uat_items]}
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return
+    queue = f"{in_uat}/{max_uat} waiting for your test" if in_uat is not None else "UAT queue not counted"
+    prs = f"{open_prs}/{max_prs} ready PRs" + (f" (+{len(drafts)} draft, {len(docs_prs)} docs-only: not counted)"
+                                               if drafts or docs_prs else "")
+    if reasons:
+        print(f"{WARN} Hold new builds: " + "; ".join(reasons) + ". Rework (uat-failed), finishing open PRs, specs and "
+              "assessments are still fine.")
+    else:
+        print(f"{OK} Room for new work: {queue}; {prs}")
+    if window:
+        print(f"{INFO} Batch window until {window['until']} (then back to {res['normal_limits']['max_in_uat']} in UAT, "
+              f"{res['normal_limits']['max_open_prs']} ready PRs)")
+    if reasons_note:
+        print(f"{INFO} {reasons_note}")
+    if args.list or reasons:
+        for p in counted:
+            print(f"   PR #{p['number']}: {p.get('title', '')}")
+        for p in drafts:
+            print(f"   PR #{p['number']} (draft, not counted): {p.get('title', '')}")
+        for p in docs_prs:
+            print(f"   PR #{p['number']} (docs only, not counted): {p.get('title', '')}")
+        for i in uat_items:
+            print(f"   In UAT: #{i['number']} {i.get('title', '')}")
+        if reasons:
+            print("   To make room: test and ship what's waiting (/test all); close ready PRs that are stale or red "
+                  "(test-first works from the branch, so closing loses nothing); or open a batch window in "
+                  "/haam-settings (e.g. config --max-in-uat 30 --until <last day> --human)")
+
+
+# ----------------------------------------------------------------------------- CI cost: usage, settings, local review
+
+RUNNER_MULTIPLIER = {"linux": 1, "windows": 2, "macos": 10}   # how GitHub counts minutes of hosted runners
+
+
+def iso_time(s):
+    from datetime import datetime
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def cmd_ci_usage(args):
+    """Where the GitHub Actions minutes went over the last N days, by workflow, job, event and day."""
+    import math
+    from collections import defaultdict
+    from datetime import datetime, timedelta, timezone
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    repo = args.repo or cfg.get("github_repo")
+    if not repo:
+        sys.exit("Set github_repo first: python3 tools/haam/haam.py config --github-repo owner/name")
+    since = (datetime.now(timezone.utc) - timedelta(days=args.days)).date().isoformat()
+    runs, page = [], 1
+    while len(runs) < args.max_runs:
+        code, out, err = run(["gh", "api", f"repos/{repo}/actions/runs?created=%3E%3D{since}&per_page=100&page={page}"])
+        if code != 0:
+            sys.exit(f"Couldn't list workflow runs: {(err or out)[:200]}")
+        batch = json.loads(out or "{}").get("workflow_runs") or []
+        runs += batch
+        if len(batch) < 100:
+            break
+        page += 1
+    runs = runs[:args.max_runs]
+    by_wf, by_job, by_event, by_day = defaultdict(int), defaultdict(int), defaultdict(int), defaultdict(int)
+    own_runner_min, total, prs = 0, 0, set()
+    for r in runs:
+        code, out, _ = run(["gh", "api", f"repos/{repo}/actions/runs/{r['id']}/jobs?per_page=100&filter=all"])
+        jobs = (json.loads(out or "{}").get("jobs") or []) if code == 0 else []
+        for j in jobs:
+            if not j.get("started_at") or not j.get("completed_at") or j.get("conclusion") == "skipped":
+                continue
+            secs = (iso_time(j["completed_at"]) - iso_time(j["started_at"])).total_seconds()
+            if secs <= 0:
+                continue
+            labels = " ".join(j.get("labels") or []).lower()
+            mins = math.ceil(secs / 60)                          # GitHub rounds each job up to the minute
+            group = j.get("runner_group_name")
+            if "self-hosted" in labels or (group and group != "GitHub Actions"):
+                own_runner_min += mins
+                continue
+            mins *= RUNNER_MULTIPLIER["macos" if "mac" in labels else "windows" if "windows" in labels else "linux"]
+            total += mins
+            by_wf[r.get("name") or "?"] += mins
+            by_job[f"{r.get('name') or '?'} / {j.get('name') or '?'}"] += mins
+            by_event[r.get("event") or "?"] += mins
+            by_day[(r.get("created_at") or "")[:10]] += mins
+        for p in r.get("pull_requests") or []:
+            prs.add(p.get("number"))
+    res = {"repo": repo, "days": args.days, "runs": len(runs), "billable_minutes": total,
+           "own_runner_minutes": own_runner_min, "pull_requests": len(prs),
+           "minutes_per_pr": round(total / len(prs), 1) if prs else None,
+           "by_workflow": dict(sorted(by_wf.items(), key=lambda x: -x[1])),
+           "by_job": dict(sorted(by_job.items(), key=lambda x: -x[1])[:15]),
+           "by_event": dict(sorted(by_event.items(), key=lambda x: -x[1])), "by_day": dict(sorted(by_day.items()))}
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return
+    print(f"{c('1', f'GitHub Actions minutes for {repo}, last {args.days} day(s)')}  ({len(runs)} runs)")
+    print(f"  Billable minutes (estimate): {total}" + (f"   ·  on your own runner: {own_runner_min} (not billed as hosted minutes)" if own_runner_min else ""))
+    if prs:
+        print(f"  Pull requests with runs: {len(prs)}  ·  about {res['minutes_per_pr']} minutes each")
+    for title, d in (("By workflow", res["by_workflow"]), ("Biggest jobs", res["by_job"]), ("By trigger", res["by_event"]),
+                     ("By day", res["by_day"])):
+        if d:
+            print(f"\n{c('1', title)}")
+            for k, v in d.items():
+                print(f"  {v:>6}  {k}")
+    print(c("2", "\nEstimate from job durations (rounded up per job; macOS counts 10x, Windows 2x). GitHub's billing page is the exact figure."))
+
+
+# ----------------------------------------------------------------------------- Numbers: how the work flows
+
+# HAAM leaves a trail on every issue (labels, the skills' comments, the close), so the queues can be measured without a
+# status history, which GitHub Projects doesn't keep. Each marker is the first (or every) match in the issue's timeline.
+ISSUE_TIMELINE = """query($o:String!,$r:String!,$s:DateTime!,$a:String){ repository(owner:$o,name:$r){
+  issues(first:30, after:$a, orderBy:{field:UPDATED_AT, direction:DESC}, filterBy:{since:$s}){
+    pageInfo{ hasNextPage endCursor }
+    nodes{ number title body state createdAt closedAt labels(first:30){ nodes{ name } }
+      timelineItems(first:250, itemTypes:[LABELED_EVENT, CLOSED_EVENT, REOPENED_EVENT, ISSUE_COMMENT]){ nodes{ __typename
+        ... on LabeledEvent { createdAt label{ name } }
+        ... on ClosedEvent { createdAt }
+        ... on ReopenedEvent { createdAt }
+        ... on IssueComment { createdAt body } } } } } } }"""
+QUEUES = [   # key, what it measures, (from marker, to marker)
+    ("decision", "Idea → approved (G1: assessment and your decision)", "created", "decided"),
+    ("spec", "Approved → Ready (G2: the spec and your approval)", "decided", "ready"),
+    ("build", "Ready → UAT plan (the agents' build)", "ready", "uat"),
+    ("test", "UAT plan → your verdict (G4: waiting for your test)", "uat", "verdict"),
+    ("ship", "Pass → Done (G5: checks, merge, deploy)", "passed", "done"),
+]
+
+
+def issue_markers(iss):
+    """When each HAAM step happened on one issue, from its labels, the skills' comments and its close."""
+    created = iso_time(iss["createdAt"])
+    m = {"created": created, "failed": [], "passed": None, "uat": None, "ready": None, "decided": None,
+         "claimed": None, "verdict": None, "done": None}
+    labels = {l["name"] for l in (iss.get("labels") or {}).get("nodes") or []}
+    for ev in (iss.get("timelineItems") or {}).get("nodes") or []:
+        if not ev or not ev.get("createdAt"):
+            continue
+        at = iso_time(ev["createdAt"])
+        kind = ev.get("__typename")
+        if kind == "LabeledEvent":
+            name = (ev.get("label") or {}).get("name")
+            # stream:feature set well after creation is a G1 approval; set at creation, it was never an idea
+            if name == "stream:feature" and not m["decided"] and (at - created).total_seconds() > 120:
+                m["decided"] = at
+            elif name == "agent-ready" and not m["ready"]:
+                m["ready"] = at
+        elif kind == "IssueComment":
+            body = ev.get("body") or ""
+            if "Approved at G1" in body and not m["decided"]:
+                m["decided"] = at
+            elif body.startswith("🤖 Claimed by") and not re.search(r"\bto (assess|write|prototype|verify)\b", body) and not m["claimed"]:
+                m["claimed"] = at
+            elif ("docs/uat/" in body or "Fully verified by the agent" in body) and not m["uat"]:
+                m["uat"] = at
+            elif "✅ UAT passed" in body:
+                m["passed"] = at                      # the last pass: the one that shipped
+                m["verdict"] = m["verdict"] or at
+            elif "❌ UAT failed" in body:
+                m["failed"].append(at)
+                m["verdict"] = m["verdict"] or at
+    if iss.get("state") == "CLOSED" and iss.get("closedAt"):
+        m["done"] = iso_time(iss["closedAt"])
+    if "stream:bug" in labels and not m["ready"]:
+        m["ready"] = m["claimed"]                     # bugs skip G1 and G2: the claim is where the build starts
+    was_idea = any((e.get("label") or {}).get("name") == "stream:idea"
+                   for e in (iss.get("timelineItems") or {}).get("nodes") or [] if e and e.get("__typename") == "LabeledEvent")
+    if "stream:feature" in labels and not m["decided"] and not was_idea:
+        m["decided"] = created                        # born a feature (roadmap item): no decision to wait for
+        m["created"] = None                           # so it isn't counted as a 0-hour decision
+    return m
+
+
+def verify_markers(iss):
+    """uat: agents-verify on one issue: the first hand-over to a verifier, the verdicts, and a pull-back (owner-test)
+    after a verification, with whether the owner's own test then failed."""
+    m = {"handed": None, "verdicts": [], "first_verdict": None, "verified_at": None, "pulled_back": False,
+         "pulled_back_failed": False}
+    for ev in (iss.get("timelineItems") or {}).get("nodes") or []:
+        if not ev or not ev.get("createdAt"):
+            continue
+        at, kind = iso_time(ev["createdAt"]), ev.get("__typename")
+        if kind == "IssueComment":
+            body = ev.get("body") or ""
+            rec = verdict_records([{"body": body}])
+            if body.startswith(READY_VERIFY_MARK) and not m["handed"]:
+                m["handed"] = at
+            elif rec:
+                m["verdicts"].append(rec[0]["verdict"])
+                m["first_verdict"] = m["first_verdict"] or at
+                if rec[0]["verdict"] == "verified" and not m["verified_at"]:
+                    m["verified_at"] = at
+            elif "❌ UAT failed" in body and m["pulled_back"]:
+                m["pulled_back_failed"] = True
+        elif kind == "LabeledEvent" and (ev.get("label") or {}).get("name") == OWNER_TEST_LABEL and m["verified_at"] \
+                and at >= m["verified_at"]:
+            m["pulled_back"] = True
+    return m
+
+
+def percentiles(values):
+    """Median and 90th percentile of a list of numbers (None when empty)."""
+    if not values:
+        return {"n": 0, "median": None, "p90": None}
+    import statistics
+    xs = sorted(values)
+    p90 = xs[min(len(xs) - 1, int(round(0.9 * (len(xs) - 1))))]
+    return {"n": len(xs), "median": round(statistics.median(xs), 1), "p90": round(p90, 1)}
+
+
+def revert_commits(root, since):
+    """Revert commits on main (origin/main when it exists) since a date: the production rollbacks."""
+    ref = next((r for r in ("origin/main", "main") if run(["git", "rev-parse", "--verify", "-q", r], cwd=root)[0] == 0), "HEAD")
+    code, out, _ = run(["git", "log", ref, f"--since={since}", "--format=%h %s"], cwd=root)
+    return [l for l in (out or "").splitlines() if re.match(r"^\S+ Revert \"", l)] if code == 0 else []
+
+
+def cmd_metrics(args):
+    """How the work flows: time to Done, time in each queue, reruns, defects found in UAT against later, reverts."""
+    from datetime import datetime, timedelta, timezone
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    if cfg.get("tracker") == "linear":
+        sys.exit("metrics reads the issues' history on GitHub. On Linear, use Linear's insights for now (cycle time, "
+                 "time in status); the HAAM markers (uat-failed, UAT passed) are in the issues' comments there.")
+    repo = cfg.get("github_repo")
+    if not repo:
+        sys.exit("Set github_repo first: python3 tools/haam/haam.py config --github-repo owner/name")
+    owner, name = repo.split("/", 1)
+    since_dt = datetime.now(timezone.utc) - timedelta(days=args.days)
+    since = since_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    issues, after = [], None
+    while True:
+        try:
+            d = gql(ISSUE_TIMELINE, {"o": owner, "r": name, "s": since, "a": after})
+        except RuntimeError as e:
+            sys.exit(f"Couldn't read the issues: {e}")
+        page = ((d.get("repository") or {}).get("issues")) or {"nodes": [], "pageInfo": {}}
+        issues += [i for i in page["nodes"] if i]
+        if not page["pageInfo"].get("hasNextPage") or len(issues) >= args.max_issues:
+            break
+        after = page["pageInfo"].get("endCursor")
+    # The board tells Done from Canceled or Parked; without it, a closed issue counts as done.
+    status = {}
+    if cfg.get("github_project_number"):
+        try:
+            board = GHProject(cfg)
+            board.load()
+            status = {i["number"]: i.get("status") for i in board.items()}
+        except RuntimeError:
+            status = {}
+    hours = lambda a, b: round((b - a).total_seconds() / 3600, 1)
+    rows, queues = [], {k: [] for k, _, _, _ in QUEUES}
+    to_done = {"all": [], "stream:bug": [], "stream:feature": [], "stream:idea": []}
+    reruns, failures, found_in_uat, bugs_later, judge = [], 0, 0, [], {"decided": 0, "malformed": 0, "escalated": 0}
+    ver = {"handed_over": 0, "verified": [], "not_verified": 0, "sent_back": [], "needs_owner": [], "pulled_back": [],
+           "pulled_back_failed": [], "hours": []}
+    closed_at = {i["number"]: iso_time(i["closedAt"]) for i in issues if i.get("closedAt")}
+    for iss in issues:
+        labels = [l["name"] for l in (iss.get("labels") or {}).get("nodes") or []]
+        if "epic" in labels:
+            continue                                  # an epic's dates follow its sub-issues
+        m = issue_markers(iss)
+        opened = iso_time(iss["createdAt"])
+        st = status.get(iss["number"])
+        done = m["done"] if st in (None, "Done") else None
+        row = {"number": iss["number"], "title": iss.get("title", ""), "labels": labels, "status": st,
+               "created": iss["createdAt"], "done": iss.get("closedAt") if done else None, "failed_tests": len(m["failed"]),
+               "queues_h": {}}
+        if done:
+            d_days = (done - opened).total_seconds() / 86400
+            to_done["all"].append(d_days)
+            for s in ("stream:bug", "stream:feature", "stream:idea"):
+                if s in labels:
+                    to_done[s].append(d_days)
+        for key, _, a, b in QUEUES:
+            start, end = m.get(a), m.get(b) if b != "done" else done
+            if start and end and end >= start:
+                h = hours(start, end)
+                queues[key].append(h)
+                row["queues_h"][key] = h
+        vm = verify_markers(iss)
+        if vm["handed"]:
+            ver["handed_over"] += 1
+            if vm["first_verdict"] and vm["first_verdict"] >= vm["handed"]:
+                ver["hours"].append(hours(vm["handed"], vm["first_verdict"]))
+        for key, verdict in (("verified", "verified"), ("sent_back", "not-verified"), ("needs_owner", "needs-owner")):
+            if verdict in vm["verdicts"]:
+                ver[key].append(iss["number"])
+        ver["not_verified"] += vm["verdicts"].count("not-verified")
+        if vm["pulled_back"]:
+            ver["pulled_back"].append(iss["number"])
+        if vm["pulled_back_failed"]:
+            ver["pulled_back_failed"].append(iss["number"])
+        if m["failed"]:
+            reruns.append(iss["number"])
+            failures += len(m["failed"])
+        found_in_uat += len(m["failed"])
+        for ev in (iss.get("timelineItems") or {}).get("nodes") or []:
+            body = (ev or {}).get("body") or ""
+            if body.startswith("⚖️"):
+                judge["decided" if "Decided" in body else "malformed" if "alformed" in body else "escalated"] += 1
+        # A bug that names an issue already closed when the bug was opened: a defect that got past the owner's test
+        if "stream:bug" in labels:
+            text = f"{iss.get('title', '')}\n{iss.get('body') or ''}"
+            refs = {int(n) for n in re.findall(r"#(\d+)\b", text)} - {iss["number"]}
+            after_done = [n for n in refs if n in closed_at and closed_at[n] < opened and status.get(n) in (None, "Done")]
+            if after_done:
+                bugs_later.append({"bug": iss["number"], "after": sorted(after_done)})
+        rows.append(row)
+    reverts = revert_commits(root, since_dt.date().isoformat())
+    verified_set = set(ver["verified"])
+    verification = {k: v for k, v in ver.items() if k != "hours"}
+    verification.update(
+        hours_to_verdict=percentiles(ver["hours"]),
+        bugs_later=[b for b in bugs_later if verified_set & set(b["after"])],
+        reverts=[r for r in reverts if verified_set & {int(n) for n in re.findall(r"#(\d+)", r)}])
+    res = {"repo": repo, "days": args.days, "since": since, "issues": len(rows),
+           "time_to_done_days": {k: percentiles(v) for k, v in to_done.items()},
+           "queues_hours": {k: dict(percentiles(v), what=w) for k, w, _, _ in QUEUES for v in [queues[k]]},
+           "reruns": {"issues": len(reruns), "failed_tests": failures, "issue_numbers": sorted(reruns)},
+           "defects": {"found_in_uat": found_in_uat, "found_later": len(bugs_later), "later": bugs_later},
+           "reverts": {"count": len(reverts), "commits": reverts}, "judge": judge, "verification": verification,
+           "rows": rows}
+    text = metrics_text(res)
+    if args.save:
+        folder = root / "docs" / "metrics"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{datetime.now(timezone.utc).date().isoformat()}.md"
+        slim = {k: v for k, v in res.items() if k != "rows"}
+        path.write_text(f"# HAAM numbers, {datetime.now(timezone.utc).date().isoformat()}\n\n```\n{text}\n```\n\n"
+                        f"<details><summary>JSON</summary>\n\n```json\n{json.dumps(slim, indent=2)}\n```\n</details>\n")
+        res["saved"] = str(path.relative_to(root))
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return
+    print(text)
+    if args.save:
+        print(f"\n{OK} Saved to {res['saved']}")
+
+
+def metrics_text(res):
+    def days(p):
+        return "–" if p["median"] is None else f"median {p['median']} d, p90 {p['p90']} d  (n={p['n']})"
+
+    def hrs(p):
+        if p["median"] is None:
+            return "–"
+        fmt = lambda h: f"{h / 24:.1f} d" if h >= 48 else f"{h:.0f} h"
+        return f"median {fmt(p['median'])}, p90 {fmt(p['p90'])}  (n={p['n']})"
+    lines = [c("1", f"How the work flowed in {res['repo']}, last {res['days']} day(s)") + f"  ({res['issues']} issues active)",
+             c("1", "\nTime to Done (created → closed)")]
+    for k, label in (("all", "All"), ("stream:bug", "Bugs"), ("stream:feature", "Features"), ("stream:idea", "Ideas")):
+        lines.append(f"  {label:<10} {days(res['time_to_done_days'][k])}")
+    lines.append(c("1", "\nTime in each queue"))
+    for k, _, _, _ in QUEUES:
+        q = res["queues_hours"][k]
+        lines.append(f"  {q['what']:<58} {hrs(q)}")
+    r, d, v, j = res["reruns"], res["defects"], res["reverts"], res["judge"]
+    lines += [c("1", "\nReruns"), f"  {r['issues']} issue(s) came back from your test, {r['failed_tests']} failed test(s) in all"
+              + (f": #{', #'.join(str(n) for n in r['issue_numbers'][:12])}" if r["issue_numbers"] else ""),
+              c("1", "\nDefects"), f"  Found in your test (UAT): {d['found_in_uat']}   ·   Found after Done: {d['found_later']}"
+              + (" (" + ", ".join(f"#{b['bug']} after #{b['after'][0]}" for b in d["later"][:8]) + ")" if d["later"] else ""),
+              c("1", "\nReverts on main"), f"  {v['count']}" + (": " + "; ".join(v["commits"][:5]) if v["commits"] else "")]
+    vf = res.get("verification") or {}
+    if vf.get("handed_over") or vf.get("verified"):
+        nums = lambda xs: f" (#{', #'.join(str(n) for n in xs[:8])})" if xs else ""
+        lines += [c("1", "\nVerified by agents (uat: agents-verify)"),
+                  f"  Handed to a verifier: {vf['handed_over']}   ·   verified: {len(vf['verified'])}{nums(vf['verified'])}",
+                  f"  Not verified: {vf['not_verified']} verdict(s) on {len(vf['sent_back'])} ticket(s)   ·   "
+                  f"needs your test: {len(vf['needs_owner'])}{nums(vf['needs_owner'])}",
+                  f"  Pulled back after a verification: {len(vf['pulled_back'])}{nums(vf['pulled_back'])}, "
+                  f"of which failed your test: {len(vf['pulled_back_failed'])}{nums(vf['pulled_back_failed'])}",
+                  f"  Later: bugs naming a verified ticket {len(vf['bugs_later'])}, reverts {len(vf['reverts'])}"
+                  f"   ·   hand-over to verdict: {hrs(vf['hours_to_verdict'])}"]
+    if any(j.values()):
+        lines += [c("1", "\nJudge verdicts"), f"  decided {j['decided']}  ·  malformed {j['malformed']}  ·  escalated {j['escalated']}"]
+    lines.append(c("2", "\nFrom the issues' labels, the skills' comments and closes (issues updated in the window). 'Found after Done' "
+                        "counts bugs that name an issue already closed when the bug was opened: an estimate."))
+    return "\n".join(lines)
+
+
+def cmd_ci_settings(args):
+    """Older name for two of the settings (runner, review); kept so existing instructions still work."""
+    sets = []
+    if args.runner is not None:
+        sets.append(f"runner={'github' if args.runner in ('github', '') else 'self-hosted'}")
+        if args.runner not in ("github", "", "self-hosted"):
+            sets.append(f"runner_label={args.runner}")
+    if args.review is not None:
+        sets.append(f"review={args.review}")
+    args.set, args.explain = sets, False
+    return cmd_settings(args)
+
+
+def configured_value(cfg, key):
+    """The value in haam.config.json (or the default), without a window open on this computer."""
+    v = cfg.get(key)
+    return DEFAULT_CONFIG.get(key) if v in (None, "") else v
+
+
+def setting_value(cfg, key):
+    """What a setting is now: a limit's window on this computer while it lasts, else haam.config.json's value."""
+    if key in WINDOW_SETTINGS:
+        w = active_windows().get(key)
+        if w:
+            return w["value"]
+    return configured_value(cfg, key)
+
+
+def github_variables(cfg):
+    """Repository variables the workflows read (they can't read haam.config.json before they start)."""
+    return {
+        "HAAM_RUNNER": "" if setting_value(cfg, "runner") == "github" else (cfg.get("runner_label") or "self-hosted"),
+        "HAAM_REVIEW": "" if setting_value(cfg, "review") == "github" else setting_value(cfg, "review"),
+        "HAAM_CI": "" if setting_value(cfg, "ci") == "every-pr" else setting_value(cfg, "ci"),
+        "HAAM_NIGHTLY": "" if setting_value(cfg, "nightly") == "on" else "off",
+    }
+
+
+HAAM_CHECKS = set(REQUIRED_CHECKS) | {"ci-local"}
+
+
+def set_production_env(cfg, repo, rep):
+    """Production environment: the owner (and backups) must approve each deploy, unless deploy_approval is automatic."""
+    approvers = [a for a in [cfg.get("product_owner_github")] + list(cfg.get("backup_approvers_github") or []) if a]
+    automatic = setting_value(cfg, "deploy_approval") == "automatic"
+    reviewers = []
+    if not automatic:
+        for a in approvers:
+            c3, uid, _ = run(["gh", "api", f"users/{a}", "--jq", ".id"])
+            if c3 == 0 and uid.strip().isdigit():
+                reviewers.append({"type": "User", "id": int(uid)})
+            else:
+                rep.add("fail", f"GitHub user {a} not found")
+    body = {"reviewers": reviewers, "prevent_self_review": False,
+            "deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}}
+    code, _, err = gh_api("PUT", f"repos/{repo}/environments/production", body)
+    if code == 0:
+        gh_api("POST", f"repos/{repo}/environments/production/deployment-branch-policies",
+               {"name": cfg.get("default_branch", "main"), "type": "branch"})
+        rep.add("ok", "Deploys start automatically on merge (no approval)" if automatic
+                else "Each production deploy waits for approval", "" if automatic else ", ".join(approvers))
+    return code, err, body
+
+
+def recommend_limits(builders=1, chats=3, testing_hours=5.0, sittings=5, minutes_per_test=6.0, changes_per_chat=2.0,
+                     flow="test-first"):
+    """Limits sized to the team: the UAT queue to what the owner can test in one sitting, ready PRs to the agent chats
+    running at once (checks-first: plus the queue, since every change waiting for a test is a ready PR). Also compares
+    what the agents can produce in a week with what the owner can test. Inputs must be checked by the caller."""
+    per_sitting = testing_hours * 60 / sittings
+    raw_uat = round(per_sitting / minutes_per_test)
+    max_uat = int(min(50, max(3, raw_uat)))
+    running = builders * chats
+    raw_prs = 2 * running if flow != "checks-first" else max_uat + running
+    max_prs = int(min(30, max(4, raw_prs)))
+    can_test = testing_hours * 60 / minutes_per_test
+    can_make = running * changes_per_chat * 5
+    notes = []
+    if raw_uat != max_uat:
+        notes.append(f"max_in_uat is {max_uat}, the {'lowest' if raw_uat < max_uat else 'highest'} it suggests "
+                     f"(one sitting holds about {raw_uat} tests).")
+    if raw_prs != max_prs:
+        notes.append(f"max_open_prs is {max_prs}, the {'lowest' if raw_prs < max_prs else 'highest'} it suggests.")
+    if can_make > can_test * 1.1:
+        notes.append(f"The agents can produce about {can_make:.0f} changes a week; you can test about {can_test:.0f}. "
+                     "The queue will fill and agents will pause new builds. To keep up: more testing time, "
+                     "'pass all verified' in /test all, uat: bugs-skip for small fixes, or fewer agent chats.")
+    elif can_make < can_test * 0.5:
+        notes.append(f"You can test about {can_test:.0f} changes a week, and the agents produce about "
+                     f"{can_make:.0f}: room for more agent chats.")
+    if sittings <= 2:
+        notes.append(f"With {sittings} sitting(s) a week, max_in_uat already holds a whole sitting of tests. Keep a "
+                     "batch window (settings --set max_in_uat=N --until <last day> --human) for agent-heavy weekends.")
+    return {"inputs": {"builders": builders, "chats_per_builder": chats, "testing_hours_per_week": testing_hours,
+                       "sittings_per_week": sittings, "minutes_per_test": minutes_per_test,
+                       "changes_per_chat_per_day": changes_per_chat, "flow": flow},
+            "max_in_uat": max_uat, "max_open_prs": max_prs, "max_review_rounds": 2, "max_pr_lines": 400,
+            "agents_per_week": round(can_make), "you_can_test_per_week": round(can_test), "notes": notes,
+            "command": f"python3 tools/haam/haam.py settings --set max_in_uat={max_uat} --set max_open_prs={max_prs} --human"}
+
+
+def cmd_settings(args):
+    """The owner's choices for this project, with their trade-offs; --set changes them, --apply syncs GitHub."""
+    if getattr(args, "recommend", False):
+        if args.set or args.apply or args.until:
+            sys.exit("--recommend only suggests (it changes nothing): run it on its own, then --set what you chose.")
+        bad = [f"--{k} must be a whole number of 1 or more" for k, v in (("builders", args.builders), ("chats", args.chats),
+                                                                          ("sittings", args.sittings)) if v < 1]
+        bad += [f"--{k} must be a number above 0" for k, v in (("testing-hours", args.testing_hours),
+                                                              ("minutes-per-test", args.minutes_per_test),
+                                                              ("changes-per-chat", args.changes_per_chat))
+                if not (v > 0 and v != float("inf"))]
+        if bad:
+            sys.exit("; ".join(bad))
+        flow = args.flow
+        if not flow:
+            try:
+                flow = setting_value(load_config(find_repo_root(Path.cwd())), "flow")
+            except SystemExit:
+                flow = "test-first"
+        r = recommend_limits(args.builders, args.chats, args.testing_hours, args.sittings, args.minutes_per_test,
+                             args.changes_per_chat, flow)
+        if args.json:
+            print(json.dumps(r, indent=2))
+            return
+        i = r["inputs"]
+        print(f"For {i['builders']} builder(s) with {i['chats_per_builder']} agent chat(s) each, "
+              f"{i['testing_hours_per_week']:g} h of testing a week in {i['sittings_per_week']} sitting(s), "
+              f"~{i['minutes_per_test']:g} min a test, {i['flow']}:")
+        print(f"  max_in_uat         {r['max_in_uat']:<5} what you can test in one sitting")
+        print(f"  max_open_prs       {r['max_open_prs']:<5} " + ("twice the agent chats running at once"
+                                                             if i["flow"] != "checks-first" else
+                                                             "the UAT queue plus the chats running at once (checks-first)"))
+        print(f"  max_review_rounds  {r['max_review_rounds']:<5} then the agent stops and asks you")
+        print(f"  max_pr_lines       {r['max_pr_lines']:<5} smaller PRs review and test better")
+        for n in r["notes"]:
+            print(f"{INFO} {n}")
+        print(f"\nTo apply (inside /haam-settings, once you've chosen): {r['command']}")
+        return
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    rep = Report()
+    until = getattr(args, "until", None)
+    clear = [k.strip().replace("-", "_") for k in getattr(args, "clear_window", None) or []]
+    changing = bool(args.set or args.apply or until or clear)
+    if changing and not args.human:
+        sys.exit("Settings are the owner's decision. Change them only inside /haam-settings, after the human chose, "
+                 "with --human.")
+    if changing and git_paths(root)[2]:
+        sys.exit("settings changes run only from the owner's own chat in the main project folder, never from an "
+                 "agent's worktree (a temporary window included).")
+    changed = {}
+    for item in args.set or []:
+        k, _, v = item.partition("=")
+        k, v = k.strip().replace("-", "_"), v.strip()
+        if k == "runner_label" and re.fullmatch(r"[\w.-]+", v):
+            changed[k] = v
+            continue
+        if k == "owner_test_paths":        # one area per --set: <area>=<pattern>,<pattern> (empty: remove it)
+            changed[k] = set_owner_test_area(changed.get(k, owner_test_areas(cfg)), v)
+            continue
+        if k not in SETTING_KEYS:
+            sys.exit(f"Unknown setting '{k}'. Settings: {', '.join(SETTING_KEYS)} (protected areas: config --protected)")
+        opts = SETTING_KEYS[k][1]
+        if opts is int:
+            low = 0 if k in INT_SETTINGS_ZERO_OK else 1
+            if not v.isdigit() or int(v) < low:
+                sys.exit(f"{k} must be a whole number of {low} or more")
+            v = int(v)
+        elif opts is str:
+            if not v:
+                sys.exit(f"{k} must not be empty")
+        elif v not in opts:
+            sys.exit(f"{k} must be one of: {', '.join(opts)}")
+        changed[k] = v
+    refused = []
+    if changed.get("runner") == "self-hosted":
+        code, info, _ = gh_api("GET", f"repos/{cfg.get('github_repo')}")
+        if not (code == 0 and isinstance(info, dict) and info.get("private")):
+            changed.pop("runner")
+            refused.append("runner=self-hosted: own runners only on private repositories (couldn't confirm this one "
+                           "is private); on a public repository anyone's pull request could run code on your machine")
+    note = {"opened": {}, "ended": []}
+    if until:
+        # A temporary value: a window on this computer, in the common git dir. haam.config.json isn't touched.
+        if args.apply:
+            sys.exit("--until opens a window on this computer only and changes nothing on GitHub: run --apply on its own.")
+        note["opened"] = {k: w for k, w in open_limit_windows(root, changed, until).items() if k in changed}
+        changed = {}
+    if clear:
+        bad = [k for k in clear if k not in WINDOW_SETTINGS]
+        if bad:
+            sys.exit(f"Only the limits have windows ({', '.join(WINDOW_SETTINGS)}): {', '.join(bad)} has none.")
+        note["ended"] = [k for k in clear if k in active_windows(root)]
+        change_windows(root, cleared=clear)
+    pr = None
+    if changed or args.apply:
+        busy = main_folder_busy(root, cfg)
+        if busy:
+            # The main folder has a test (or other work) checked out: write the change in a temporary worktree of
+            # origin/main and open its PR, so the folder's own files stay exactly as they are.
+            pr = open_settings_worktree(root, cfg, busy)
+    try:
+        return settings_change(args, pr["path"] if pr else root, load_config(pr["path"]) if pr else cfg, rep,
+                               changed, refused, note, pr)
+    finally:
+        if pr:
+            close_settings_worktree(root, pr)
+
+
+def main_folder_busy(root, cfg):
+    """Why the main folder can't take a settings change in its own files ('' when it can): another branch or a
+    commit is checked out there (a test: writing there would leave an unsaved change under it). On the default
+    branch, unsaved changes are the owner's own work in progress (setup writes many files before its first commit),
+    and the change is written there as before."""
+    if not git_out(root, "rev-parse", "--verify", "--quiet", "HEAD"):
+        return ""                                       # no commit yet (first setup): nothing to keep apart
+    base = cfg.get("default_branch") or "main"
+    branch = git_out(root, "rev-parse", "--abbrev-ref", "HEAD")
+    if branch != base:
+        return f"it has {'a commit' if branch in ('HEAD', '') else branch} checked out, not {base}"
+    return ""
+
+
+def open_settings_worktree(root, cfg, why):
+    """A temporary worktree of a fresh origin/main on a new chore/haam-settings-<time> branch, outside the project."""
+    base = cfg.get("default_branch") or "main"
+    code, _, err = run(["git", "fetch", "--quiet", "origin", base], cwd=root)
+    if code != 0:
+        sys.exit(f"The main folder is busy ({why}), so the change goes in a temporary copy of origin/{base}, but "
+                 f"fetching it failed: {(err or '')[:200]}. Try again, or once the main folder is back on {base}.")
+    stamp = time.strftime("%Y%m%d-%H%M")
+    branch, n = f"chore/haam-settings-{stamp}", 2
+    while git_out(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}") or \
+            git_out(root, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"):
+        branch, n = f"chore/haam-settings-{stamp}-{n}", n + 1
+    path = Path(tempfile.mkdtemp(prefix="haam-settings-"))
+    code, _, err = run(["git", "worktree", "add", "-b", branch, str(path), f"origin/{base}"], cwd=root)
+    if code != 0:
+        shutil.rmtree(path, ignore_errors=True)
+        sys.exit(f"Couldn't make a temporary copy of origin/{base} for the change: {(err or '')[:200]}")
+    return {"path": path, "branch": branch, "base": base, "why": why, "url": "", "pushed": False, "error": "",
+            "changes": {}}
+
+
+def settings_pr(work, cfg, pr, changes, before):
+    """Commit a settings change made in the temporary worktree, push its branch and open its PR (or update it)."""
+    summary = ", ".join(f"{k}={v}" for k, v in changes.items())
+    run(["git", "add", CONFIG_NAME], cwd=work)
+    if not git_out(work, "diff", "--cached", "--name-only"):
+        return
+    code, _, err = run(["git", "commit", "-q", "-m", f"chore: haam settings {summary}"], cwd=work)
+    if code != 0:
+        pr["error"] = f"Couldn't commit the change: {(err or '')[:200]}"
+        return
+    code, _, err = run(["git", "push", "-q", "-u", "origin", pr["branch"]], cwd=work)
+    if code != 0:
+        pr["error"] = (f"Couldn't push {pr['branch']}: {(err or '')[:200]}. The change is committed there: push it "
+                       f"(git push -u origin {pr['branch']}) and open its PR.")
+        return
+    pr["pushed"] = True
+    pr["changes"].update(changes)
+    if pr["url"]:
+        return                                          # the push updated the PR
+    rows = "".join(f"| `{k}` | {before.get(k, '')} | {v} |\n" for k, v in changes.items())
+    body = (f"The owner changed these HAAM settings (`/haam-settings`):\n\n| Setting | Was | Now |\n|---|---|---|\n{rows}\n"
+            f"Made in a temporary copy of `{pr['base']}`, because the main folder was busy ({pr['why']}): its files "
+            "were left as they were.\n\n"
+            f"`{CONFIG_NAME}` is a protected file: review and merge this PR (on GitHub, or with `/test` and `ship`). "
+            f"Agents and the release gate read the settings from `{pr['base']}`, so the change counts once it's merged.\n")
+    fd, f = tempfile.mkstemp(prefix="haam-settings-pr-", suffix=".md")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(body)
+    repo = cfg.get("github_repo") or detect_github_repo(work)
+    code, out, err = run(["gh", "pr", "create"] + (["-R", repo] if repo else []) + [
+        "--head", pr["branch"], "--base", pr["base"], "--title", f"chore: haam settings {summary}", "--body-file", f],
+        cwd=work)
+    os.unlink(f)
+    if code != 0:
+        pr["error"] = (f"Pushed {pr['branch']}, but couldn't open its PR: {(err or out or '')[:200]}. Open it on "
+                       "GitHub.")
+        return
+    pr["url"] = out.strip().splitlines()[-1] if out else ""
+
+
+def close_settings_worktree(root, pr):
+    """Remove the temporary worktree; keep its branch only when it holds a commit that didn't reach GitHub."""
+    run(["git", "worktree", "remove", "--force", str(pr["path"])], cwd=root)
+    shutil.rmtree(pr["path"], ignore_errors=True)
+    run(["git", "worktree", "prune"], cwd=root)
+    if pr["pushed"] or not git_out(root, "rev-list", f"origin/{pr['base']}..{pr['branch']}"):
+        run(["git", "branch", "-D", pr["branch"]], cwd=root)
+
+
+def settings_change(args, root, cfg, rep, changed, refused, note, pr):
+    """The rest of `settings`: save the changes in `root` (with `pr`, a temporary worktree of main: then commit them
+    and open their PR), show the settings, and --apply them on GitHub."""
+    raw = {}
+    try:
+        raw = json.loads((root / CONFIG_NAME).read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    if (changed.get("grouping") or setting_value(cfg, "grouping")) == "release" and \
+            (changed.get("flow") or setting_value(cfg, "flow")) == "checks-first":
+        sys.exit("grouping release needs flow test-first: in checks-first every change already has its own PR.")
+    if (changed.get("uat") or setting_value(cfg, "uat")) == "agents-verify" and ("uat" in changed or
+                                                                                "owner_test_paths" in changed):
+        if not owner_test_areas({"owner_test_paths": changed.get("owner_test_paths", cfg.get("owner_test_paths"))}):
+            sys.exit("uat agents-verify needs owner_test_paths first: the areas that always keep your own test (e.g. "
+                     "--set owner_test_paths=sign-in=src/auth/** --set owner_test_paths=gates=AGENTS.md,.agents/**,"
+                     "tools/haam/**,.github/**,haam.config.json). Without them every change could skip you.")
+        if cfg.get("tracker") != "github":
+            sys.exit("uat agents-verify needs the GitHub tracker: the verifier records its verdict on GitHub issues.")
+    if (changed.get("uat") or setting_value(cfg, "uat")) == "agents-verify" and \
+            (changed.get("grouping") or setting_value(cfg, "grouping")) != "release" and \
+            ("uat" in changed or "grouping" in changed):
+        sys.exit("uat agents-verify needs grouping release for now: a verified change joins the next release on your "
+                 "`ship`. One PR per change for verified tickets isn't in the kit yet.")
+    if "owner_test_paths" in changed:
+        tracked = git_out(root, "ls-files").splitlines()
+        for area, pats in changed["owner_test_paths"].items():
+            for x in pats:
+                if tracked and not protected_matches([x], tracked) and not args.json:
+                    print(f"{WARN} owner_test_paths {area}: '{x}' matches no file in the repository (check the "
+                          "spelling, e.g. src/auth/** for everything in src/auth)")
+    if changed:
+        before = {k: configured_value(cfg, k) for k in changed}
+        cfg.update(changed)
+        save_config(root, cfg)
+        if pr:
+            settings_pr(root, cfg, pr, changed, before)
+    rows = []
+    _, _, window = effective_limits(cfg)
+    windows = active_windows(root)
+    for group, key, opts, what, helps in SETTINGS:
+        val = setting_value(cfg, key)
+        rows.append({"group": group, "key": key, "value": val, "configured": configured_value(cfg, key),
+                     "window": windows.get(key), "default": DEFAULT_CONFIG.get(key),
+                     "options": list(opts) if isinstance(opts, list) else [], "what": what, "options_help": helps,
+                     "changed_now": key in changed or key in note["opened"]})
+    res = {"settings": rows, "protected_paths": cfg.get("protected_paths"), "heavy_runs": cfg.get("heavy_runs") or [],
+           "owner_test_paths": owner_test_areas(cfg),
+           "batch_window": window, "windows": windows, "windows_opened": note["opened"], "windows_ended": note["ended"],
+           "github_variables": github_variables(cfg),
+           "required_checks": required_checks(cfg), "applied": [], "changed": changed, "refused": refused,
+           "settings_pr": None}
+    for r_ in refused:
+        rep.add("fail", "Not changed: " + r_)
+    if args.apply:
+        rep.section("Applying the settings on GitHub")
+        if not gh_ready(rep, cfg):
+            rep.print(args.json)
+            return
+        repo = cfg["github_repo"]
+        code, out, _ = run(["gh", "variable", "list", "-R", repo, "--json", "name,value"])
+        current = {v["name"]: v["value"] for v in json.loads(out or "[]")} if code == 0 else {}
+        if "runner" not in raw and "runner" not in changed and current.get("HAAM_RUNNER"):
+            # Set up before 1.9.0 (a variable only): adopt it rather than move the jobs back to GitHub's runners.
+            before = {k: configured_value(cfg, k) for k in ("runner", "runner_label")}
+            cfg["runner"], cfg["runner_label"] = "self-hosted", current["HAAM_RUNNER"]
+            save_config(root, cfg)
+            if pr:
+                settings_pr(root, cfg, pr, {"runner": "self-hosted", "runner_label": current["HAAM_RUNNER"]}, before)
+            rep.add("info", f"Kept your own runner ({current['HAAM_RUNNER']}) and recorded it in {CONFIG_NAME}")
+        for name, value in github_variables(cfg).items():
+            if (current.get(name) or "") == value:
+                continue
+            cmd = (["gh", "variable", "set", name, "--body", value, "-R", repo] if value
+                   else ["gh", "variable", "delete", name, "-R", repo])
+            c2, _, e2 = run(cmd)
+            rep.add("ok" if c2 == 0 or not value else "fail", f"{name} = {value or '(default)'}", (e2 or "")[:120] if c2 else "")
+            res["applied"].append(name)
+        # Required checks follow the settings (e.g. ci-local instead of ci); the project's own extra checks stay.
+        code, rulesets, _ = gh_api("GET", f"repos/{repo}/rulesets")
+        rs = next((r for r in rulesets if r.get("name") == "HAAM main protection"), None) if isinstance(rulesets, list) else None
+        full = gh_api("GET", f"repos/{repo}/rulesets/{rs['id']}")[1] if rs else None
+        if isinstance(full, dict):
+            rule = next((r for r in full.get("rules") or [] if r["type"] == "required_status_checks"), None)
+            if rule:
+                params = rule.setdefault("parameters", {})
+                have = [c.get("context") for c in params.get("required_status_checks") or []]
+                want = [c for c in have if c not in HAAM_CHECKS] + required_checks(cfg)
+                if have != want:
+                    params["required_status_checks"] = [{"context": c} for c in want]
+                    body = {k: full[k] for k in ("name", "target", "enforcement", "conditions", "bypass_actors") if k in full}
+                    body["rules"] = [{k: v for k, v in r.items() if k in ("type", "parameters")} for r in full["rules"]]
+                    c3, _, e3 = gh_api("PUT", f"repos/{repo}/rulesets/{rs['id']}", body)
+                    rep.add("ok" if c3 == 0 else "fail", "Required checks: " + ", ".join(want), (e3 or "")[:160])
+                    if c3 == 0:
+                        res["applied"].append("required_checks")
+                    else:
+                        res.setdefault("failed", []).append("required_checks")
+        else:
+            rep.add("warn", "No 'HAAM main protection' ruleset found", "run haam.py github --apply first")
+        code, env, _ = gh_api("GET", f"repos/{repo}/environments/production")
+        now_auto = code == 0 and isinstance(env, dict) and not any(
+            r.get("type") == "required_reviewers" and (r.get("reviewers") or []) for r in env.get("protection_rules") or [])
+        want_auto = setting_value(cfg, "deploy_approval") == "automatic"
+        if code == 0 and want_auto != now_auto:
+            c_e, e_e, _ = set_production_env(cfg, repo, rep)
+            if c_e != 0:
+                rep.add("warn", "Couldn't change the production approval", (e_e or "")[:160] + (
+                    " (on private repositories, required reviewers need GitHub Enterprise Cloud)" if not want_auto else ""))
+                res.setdefault("failed", []).append("production")
+            else:
+                res["applied"].append("production")
+        elif code != 0:
+            rep.add("warn", "No production environment yet", "run haam.py github --apply first")
+        if pr and pr["url"]:
+            rep.action(WHO_TERMINAL, f"Review and merge the settings PR: the gate and the agents read the settings "
+                       f"from main ({pr['url']})")
+        elif not pr:
+            rep.action(WHO_AGENT, f"Commit {CONFIG_NAME} and get it merged: the gate and the agents read the settings "
+                       "from main (it's a protected file, so it needs your review)")
+    if pr:
+        res["settings_pr"] = {k: pr[k] for k in ("branch", "url", "error", "why")}
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return
+    group = None
+    for r in rows:
+        if r["group"] != group:
+            group = r["group"]
+            print(f"\n{group}")
+        tag = "" if r["value"] == r["default"] else f"   (default: {r['default']})"
+        if r["window"]:
+            tag = f"   (window until {r['window']['until']}; normally {r['configured']})"
+        mark = f"{OK} " if r["changed_now"] else "  "
+        print(f"{mark}{r['key']:<18} {str(r['value']):<14} {r['what']}{tag}")
+        if args.explain:
+            for o in r["options"]:
+                print(f"      {'→' if o == r['value'] else '·'} {o}: {r['options_help'].get(o, '')}")
+    print(f"\n  protected_paths    {', '.join(cfg.get('protected_paths') or [])}")
+    areas = owner_test_areas(cfg)
+    print("  owner_test_paths   " + ("; ".join(f"{a}: {', '.join(p_)}" for a, p_ in areas.items()) if areas else
+                                    "(none: needed before uat agents-verify)"))
+    print(f"  heavy_runs         {', '.join(cfg.get('heavy_runs') or []) or '(none: haam.py exclusive only takes turns)'}")
+    print(f"  production code    {', '.join(cfg.get('production_paths') or ['**'])}, except "
+          f"{', '.join((cfg.get('non_production_paths') or NON_PRODUCTION_DEFAULT)[:6])} …")
+    if window and not windows:
+        print(f"  batch window       until {window['until']}: " + ", ".join(f"{k} {v}" for k, v in window.items()
+                                                                           if k != "until"))
+    for k, w in windows.items():
+        print(f"  window             {window_line(k, w)} (on this computer, set {w.get('set_at', '?')}; then back "
+              f"to {configured_value(cfg, k)})")
+    if note["opened"]:
+        print(f"\n{OK} Window open on this computer, counting at once in every chat here: "
+              + ", ".join(window_line(k, w) for k, w in note["opened"].items())
+              + f". {CONFIG_NAME} keeps the normal value; the window ends by itself.")
+    for k in note["ended"]:
+        print(f"{OK} Window for {k} ended: back to {configured_value(cfg, k)}")
+    if pr and pr["url"]:
+        print(f"\n{OK} Opened {pr['url']} ({', '.join(f'{k}={v}' for k, v in pr['changes'].items())}). The main "
+              f"folder was left as it is: {pr['why']}. The change counts once the PR merges into {pr['base']}; for a "
+              "limit that must count at once, open a window (--set max_in_uat=N --until <last day> --human).")
+    elif pr and pr["error"]:
+        print(f"\n{BAD} {pr['error']}")
+    elif changed:
+        print(f"\n{OK} Saved in {CONFIG_NAME}: " + ", ".join(f"{k}={v}" for k, v in changed.items()))
+    for r_ in refused:
+        print(f"{BAD} Not changed: {r_}")
+    if not args.apply and not note["opened"] and not note["ended"]:
+        print(f"{INFO} Settings that change GitHub (runner, review, ci, nightly, deploy_approval) take effect with "
+              "--apply." + (" With the main folder busy, --apply reads main's settings: run it once this PR merges "
+                            "(or with these --set in one call)." if pr else " Then commit haam.config.json."))
+    rep.print(False) if args.apply else None
+
+
+def cmd_local_ci(args):
+    """ci = local: run `make check` on a clean copy of the PR's commit on this computer and post the result as the
+    PR's `ci-local` status (the check the branch rules require in this mode)."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    repo = cfg["github_repo"]
+    num = args.pr
+    if not num:
+        if not args.issue:
+            sys.exit("Give the issue (local-ci 12) or the PR (--pr 34)")
+        try:
+            pr = find_pr(cfg, issue_ref(cfg, args.issue), ("open",))
+        except RuntimeError as e:
+            sys.exit(str(e))
+        if not pr:
+            sys.exit("No open PR for that issue.")
+        num = pr["number"]
+    sha = pr_head(repo, num)
+    if not sha:
+        sys.exit(f"Couldn't read PR #{num}'s head commit.")
+    run(["git", "fetch", "--quiet", "origin", sha], cwd=root)
+    _, main, _ = git_paths(root)
+    wt = main / ".haam" / f"local-ci-{num}"
+    run(["git", "worktree", "remove", "--force", str(wt)], cwd=root)
+    code, _, err = run(["git", "worktree", "add", "--detach", str(wt), sha], cwd=root)
+    if code != 0:
+        sys.exit(f"Couldn't check out {sha[:8]}: {err[:200]}")
+    gh_api("POST", f"repos/{repo}/statuses/{sha}", {"state": "pending", "context": "ci-local",
+                                                     "description": f"make check running on {gh_login() or 'the owner'}'s computer"})
+    print(f"{INFO} make setup && make check on PR #{num} at {sha[:8]} (a clean copy in {wt.relative_to(main)})…", flush=True)
+    # With heavy_runs set, wait for this machine's other heavy runs (agents' make check) so they don't collide.
+    turn = (MachineTurn(f"local-ci for PR #{num}", cfg.get("heavy_runs"), args.timeout,
+                        say=lambda m: print(m, flush=True), cwd=root)
+            if cfg.get("heavy_runs") else contextlib.nullcontext())
+    try:
+        copy_includes(main, wt)       # local-only files the build needs (.worktreeinclude), as for an agent's worktree
+        mk = (wt / "Makefile").read_text(errors="ignore") if (wt / "Makefile").exists() else ""
+        with turn:
+            if re.search(r"^setup:", mk, re.M):
+                subprocess.run(["make", "setup"], cwd=wt, timeout=args.timeout * 60, check=True)
+            p = subprocess.run(["make", "check"], cwd=wt, timeout=args.timeout * 60)
+            ok = p.returncode == 0
+            desc = "make check passed on the owner's computer" if ok else "make check failed on the owner's computer"
+            if ok and re.search(r"^audit:", mk, re.M):
+                a = subprocess.run(["make", "audit"], cwd=wt, timeout=args.timeout * 60)     # the dependencies check too
+                if a.returncode != 0:
+                    ok, desc = False, "make audit found vulnerable dependencies (owner's computer)"
+                else:
+                    desc = "make check and make audit passed on the owner's computer"
+    except TimeoutError:
+        ok, desc = False, f"this computer's other heavy runs didn't finish within {args.timeout} minutes"
+    except subprocess.TimeoutExpired:
+        ok, desc = False, f"make check didn't finish within {args.timeout} minutes"
+    except subprocess.CalledProcessError:
+        ok, desc = False, "make setup failed on the owner's computer"
+    finally:
+        run(["git", "worktree", "remove", "--force", str(wt)], cwd=root)
+    if pr_head(repo, num) != sha:
+        gh_api("POST", f"repos/{repo}/statuses/{sha}", {"state": "error", "context": "ci-local",
+                                                         "description": "The PR changed while checking: run local-ci again"})
+        sys.exit("The PR changed while the check ran. Run it again.")
+    gh_api("POST", f"repos/{repo}/statuses/{sha}", {"state": "success" if ok else "failure", "context": "ci-local",
+                                                     "description": desc})
+    print(f"{OK if ok else BAD} {desc} (posted as ci-local on PR #{num})")
+    sys.exit(0 if ok else 1)
+
+
+REVIEW_DENY = "Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task,Agent"
+MAX_DIFF = 200_000
+
+
+def review_inputs(root, repo, num, sha):
+    """Everything the reviewer needs, gathered by this tool, so the reviewer itself needs no commands.
+    The instructions come from origin/main, not from the PR's branch (which the PR's author controls)."""
+    base = git_out(root, "merge-base", "origin/main", sha) or "origin/main"
+    diff = git_out(root, "diff", f"{base}..{sha}")
+    if len(diff) > MAX_DIFF:
+        diff = diff[:MAX_DIFF] + "\n\n[diff truncated: read the remaining files directly]"
+    rules = git_out(root, "show", "origin/main:.github/review/REVIEWER.md") or "(REVIEWER.md not found on main)"
+    code, out, _ = run(["gh", "pr", "view", str(num), "-R", repo, "--json", "title,body"])
+    meta = json.loads(out) if code == 0 and out else {}
+    spec_note = ""
+    for n in pr_title_issues(meta) or []:
+        if not isinstance(n, int):
+            continue
+        c2, o2, _ = run(["gh", "issue", "view", str(n), "-R", repo, "--json", "comments"])
+        bodies = [c.get("body", "") for c in (json.loads(o2).get("comments") or [])] if c2 == 0 and o2 else []
+        approved = [m.group(1) for b_ in bodies for m in [re.search(r"Spec approved by .*? at ([0-9a-f]{7,40})", b_)] if m]
+        if approved:
+            changed = git_out(root, "diff", "--stat", f"{approved[-1]}..{sha}", "--", "docs/specs/")
+            spec_note += (f"\nIssue #{n}: spec approved at {approved[-1]}. Spec changes since then:\n"
+                          f"{changed or '(none)'}\n")
+    return meta, diff, rules, spec_note or "\n(No 'spec approved' comment found.)\n"
+
+
+def review_prompts(repo, num, sha, meta, diff, rules, spec_note):
+    head = (f"You are an independent reviewer for pull request #{num} in {repo}, at commit {sha}. You did not write "
+            "this code. The folder you're in is a clean checkout of that commit: read any file you need. You can't "
+            "run commands and must not change files; everything else you need is below.\n\n"
+            f"PR title: {meta.get('title', '')}\nPR description:\n{meta.get('body', '')}\n\n"
+            f"Spec approval check:{spec_note}\nThe diff (base...{sha}):\n```diff\n{diff}\n```\n")
+    code = (head + "\nFollow these review instructions (from the main branch), but instead of posting a comment or "
+            "writing a file, reply with the review comment itself in Markdown, then a last line that is exactly "
+            "`VERDICT: APPROVE` or `VERDICT: CHANGES_REQUESTED`.\n\n" + rules)
+    security = (head + "\nReview it for security only: real, exploitable problems such as secrets or credentials, "
+                "injection, missing authorisation, unsafe handling of personal data, insecure defaults, dangerous "
+                "dependencies; and section D of the review instructions below. Report only findings you're confident "
+                "about, each with file, line, risk and fix. Reply in Markdown, then a last line that is exactly "
+                "`SECURITY_FINDINGS: <number>`.\n\n" + rules)
+    return code, security
+
+
+def run_reviewer(cmd_template, prompt, cwd, timeout_min):
+    template = cmd_template or ["claude", "-p", "{prompt}", "--allowedTools", "Read,Glob,Grep",
+                                "--disallowedTools", REVIEW_DENY]
+    cmd = [prompt if part == "{prompt}" else part for part in template]
+    if not shutil.which(cmd[0]):
+        raise RuntimeError(f"'{cmd[0]}' isn't installed. Install Claude Code, or set \"review_command\" in "
+                           "haam.config.json on main for your tool (with {prompt} where the instructions go).")
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout_min * 60,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"The reviewer didn't finish within {timeout_min} minutes")
+    return p.stdout or ""
+
+
+def cmd_review(args):
+    """Run the two independent reviews on this machine, in fresh agent sessions that can only read a clean
+    checkout of the PR's commit, and post them as the PR's comments and ai-review / security-review statuses.
+    For projects that chose `ci-settings --review local`."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    repo = cfg["github_repo"]
+    num = args.pr
+    if not num:
+        if not args.issue:
+            sys.exit("Give the issue (review 12) or the PR (--pr 34)")
+        try:
+            pr = find_pr(cfg, issue_ref(cfg, args.issue), ("open",))
+        except RuntimeError as e:
+            sys.exit(str(e))
+        if not pr:
+            sys.exit(f"No open pull request for {args.issue}")
+        num = pr["number"]
+
+    def head():
+        code, out, err = run(["gh", "pr", "view", str(num), "-R", repo, "--json", "headRefOid,labels,isDraft,url"])
+        if code != 0:
+            sys.exit(f"Couldn't read PR #{num}: {err}")
+        return json.loads(out)
+
+    pr = head()
+    labels = [l["name"] for l in pr.get("labels") or []]
+    if "human-review" in labels:
+        sys.exit(f"PR #{num} touches a protected area (label human-review): its AI reviews run on GitHub, not here.")
+    if pr.get("isDraft"):
+        sys.exit(f"PR #{num} is still a draft. Mark it ready first (gh pr ready {num}).")
+    sha = pr["headRefOid"]
+    run(["git", "fetch", "--quiet", "origin", "main"], cwd=root)
+    run(["git", "fetch", "--quiet", "origin", f"+refs/pull/{num}/head:refs/remotes/origin/pr/{num}"], cwd=root)
+    # The reviewer runs with the main branch's settings, not anything the PR's branch could change.
+    main_cfg = {}
+    try:
+        main_cfg = json.loads(git_out(root, "show", f"origin/main:{CONFIG_NAME}") or "{}")
+    except ValueError:
+        pass
+    who = gh_login() or "the owner"
+    machine = os.uname().nodename if hasattr(os, "uname") else "this computer"
+
+    def post(context, state, desc):
+        c2, _, e2 = gh_api("POST", f"repos/{repo}/statuses/{sha}", {"state": state, "context": context,
+                                                                   "description": desc[:140]})
+        if c2 != 0:
+            raise RuntimeError(f"Couldn't post the {context} status: {str(e2)[:160]}")
+
+    _, main_dir, _ = git_paths(root)
+    checkout = main_dir / WORKTREE_DIR / f"review-pr-{num}"
+    results = {}
+    try:
+        if checkout.exists():
+            run(["git", "worktree", "remove", "--force", str(checkout)], cwd=main_dir)
+        code, _, err = run(["git", "worktree", "add", "--quiet", "--detach", str(checkout), sha], cwd=main_dir)
+        if code != 0:
+            raise RuntimeError(f"Couldn't check out the PR's commit {sha[:8]}: {err}")
+        meta, diff, rules, spec_note = review_inputs(root, repo, num, sha)
+        code_prompt, sec_prompt = review_prompts(repo, num, sha, meta, diff, rules, spec_note)
+        for context, prompt in (("ai-review", code_prompt), ("security-review", sec_prompt)):
+            if args.only and args.only != context:
+                continue
+            post(context, "pending", f"Local review running ({who} on {machine})")
+            try:
+                text = run_reviewer(main_cfg.get("review_command"), prompt, checkout, args.timeout)
+            except RuntimeError as e:
+                post(context, "error", f"Local review didn't finish: {e}"[:140])
+                raise
+            lines = text.strip().splitlines()
+            tail = [l.strip().strip("`*") for l in lines[-5:]]
+            if context == "ai-review":
+                verdict = next((l.split(":", 1)[1].strip() for l in reversed(tail) if l.startswith("VERDICT:")), "")
+                state = {"APPROVE": "success", "CHANGES_REQUESTED": "failure"}.get(verdict, "error")
+                desc = {"success": "Local AI review approved", "failure": "Changes requested: see PR comment"}.get(
+                    state, "Local review gave no verdict: run it again")
+                title = "🤖 Independent review (local)"
+            else:
+                m = next((l for l in reversed(tail) if l.startswith("SECURITY_FINDINGS:")), "")
+                n = m.split(":", 1)[1].strip() if m else ""
+                state = "success" if n == "0" else "failure" if n.isdigit() else "error"
+                desc = {"success": "No security findings (local review)",
+                        "failure": f"{n} security finding(s): see PR comment"}.get(state, "Local security review gave no result")
+                title = "🔒 Security review (local)"
+            if head()["headRefOid"] != sha:
+                post(context, "error", "The PR changed during the review: run it again")
+                raise RuntimeError(f"PR #{num} changed while it was being reviewed. Run the review again.")
+            body = "\n".join(l for l in lines if not l.strip().strip("`*").startswith(("VERDICT:", "SECURITY_FINDINGS:")))
+            note = Path(checkout.parent / f"review-pr-{num}-{context}.md")
+            note.write_text(f"### {title}\n_Commit {sha[:8]} · run by {who} on {machine} with `haam.py review`._\n\n{body}\n")
+            run(["gh", "pr", "comment", str(num), "-R", repo, "--body-file", str(note)])
+            note.unlink()
+            post(context, state, f"{desc} · {who} on {machine}")
+            results[context] = state
+    except RuntimeError as e:
+        sys.exit(str(e))
+    finally:
+        if checkout.exists():
+            run(["git", "worktree", "remove", "--force", str(checkout)], cwd=main_dir)
+    if args.json:
+        print(json.dumps({"pr": num, "commit": sha, "results": results}, indent=2))
+        return
+    for k, v in results.items():
+        print(f"{OK if v == 'success' else BAD} {k}: {v}")
+    if any(v != "success" for v in results.values()):
+        print("Fix the findings (see the PR comments), push once, and run the review again.")
+
+# ----------------------------------------------------------------------------- worktrees (parallel chats)
+
+WORKTREE_DIR = ".claude/worktrees"   # same place Claude Code uses, so both kinds are listed and cleaned together
+WORKTREE_INCLUDE = ".worktreeinclude"
+WORKTREE_IDLE_HOURS = 24
+WORKTREE_MERGED_PRS = 200     # merged PRs `worktree clean` reads (newest first) to tell shipped work from open work
+
+
+def git_out(cwd, *a):
+    code, out, _ = run(["git", *a], cwd=cwd)
+    return out if code == 0 else ""
+
+
+def git_paths(cwd):
+    """(this checkout's top folder, the main checkout's top folder, True if this is a linked worktree)."""
+    top = Path(git_out(cwd, "rev-parse", "--show-toplevel") or cwd).resolve()
+    gd = git_out(top, "rev-parse", "--git-dir")
+    cd = git_out(top, "rev-parse", "--git-common-dir")
+    git_dir = (top / gd).resolve() if gd else top / ".git"
+    common = (top / cd).resolve() if cd else git_dir
+    main = common.parent if common.name == ".git" else top
+    return top, main, git_dir != common
+
+
+def worktree_base(main, cfg=None):
+    """Absolute folder where HAAM creates agent worktrees (`worktree_dir` in config, default `.claude/worktrees`)."""
+    if cfg is None and (Path(main) / CONFIG_NAME).exists():
+        try:
+            cfg = load_config(main)
+        except SystemExit:
+            cfg = {}
+    rel = ((cfg or {}).get("worktree_dir") or WORKTREE_DIR).strip() or WORKTREE_DIR
+    p = Path(rel)
+    return p.resolve() if p.is_absolute() else (Path(main) / p).resolve()
+
+
+def worktree_dir_label(cfg=None):
+    """The configured worktree path as shown to agents (relative string from config)."""
+    return ((cfg or {}).get("worktree_dir") or WORKTREE_DIR).strip() or WORKTREE_DIR
+
+
+def default_base(root):
+    ref = git_out(root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if ref:
+        return ref
+    if git_out(root, "rev-parse", "--verify", "--quiet", "origin/main"):
+        return "origin/main"
+    return "HEAD"
+
+
+def include_patterns(main):
+    f = main / WORKTREE_INCLUDE
+    if not f.exists():
+        return []
+    return [l.strip() for l in f.read_text().splitlines() if l.strip() and not l.strip().startswith("#")]
+
+
+def copy_includes(main, dest, cfg=None):
+    """Copy git-ignored local files and folders listed in .worktreeinclude (e.g. .env, an SDK's frameworks) from the
+    main folder into a worktree. Never overwrites, never copies tracked files, never prints contents. Returns
+    (copied, skipped); a folder is listed with a trailing `/`.
+
+    ⛔ A FOLDER IS COPIED WITH ITS SYMLINKS AS LINKS (#1296). An iOS framework is mostly links (`Headers ->
+    Versions/Current/Headers`); a copy that followed or dropped them left the App target unable to find
+    `opencv2/core.hpp`, and this function skipped every pattern that was not a file, so prep said "none needed". A
+    folder already there gets back any link it is missing; nothing in it is overwritten."""
+    copied, skipped = [], []
+    if main.resolve() == dest.resolve():
+        return copied, skipped
+    area = worktree_base(main, cfg)
+    for pat in include_patterns(main):
+        pat = pat.lstrip("/")
+        for src in sorted(main.glob(pat)):
+            if not (src.is_file() or src.is_dir()):
+                continue
+            try:
+                if area in src.resolve().parents or src.resolve() == area:
+                    continue
+            except ValueError:
+                pass
+            rel = src.relative_to(main).as_posix()
+            shown = rel + "/" if src.is_dir() else rel
+            if run(["git", "check-ignore", "-q", rel], cwd=main)[0] != 0:
+                skipped.append(shown + " (tracked or not git-ignored)")
+                continue
+            target = dest / rel
+            if src.is_dir():
+                if not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(src, target, symlinks=True)
+                    copied.append(shown)
+                else:
+                    restored = restore_links(src, target)
+                    if restored:
+                        copied.append(f"{shown} ({restored} missing link{'s' if restored != 1 else ''} restored)")
+                continue
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
+            copied.append(rel)
+    return copied, skipped
+
+
+def restore_links(src, target):
+    """Every symlink under [src] that [target] has nothing at, made again as the same link. Returns how many.
+
+    Only adds: a path that exists in [target] in any form, file, folder or link, is left exactly as it is."""
+    restored = 0
+    for folder, dirs, files in os.walk(src):
+        here = Path(folder)
+        for name in dirs + files:
+            link = here / name
+            if not link.is_symlink():
+                continue
+            twin = target / link.relative_to(src)
+            if os.path.lexists(twin) or not twin.parent.is_dir():
+                continue
+            os.symlink(os.readlink(link), twin)
+            restored += 1
+    return restored
+
+
+def list_worktrees(root, cfg=None, also=None):
+    """Every worktree of this clone. `haam_area` is True for one inside worktree_dir, .claude/worktrees or a folder
+    in `also` (worktree clean --also: a folder an older rule had agents use)."""
+    _, main, _ = git_paths(root)
+    if cfg is None and (main / CONFIG_NAME).exists():
+        try:
+            cfg = load_config(main)
+        except SystemExit:
+            cfg = {}
+    # Claude Code makes its own worktrees in .claude/worktrees whatever worktree_dir says, so both count
+    areas = {worktree_base(main, cfg), (main / WORKTREE_DIR).resolve()}
+    areas |= {Path(a).expanduser().resolve() for a in also or []}
+    out, cur = [], {}
+    for line in git_out(main, "worktree", "list", "--porcelain").splitlines() + [""]:
+        if not line:
+            if cur:
+                out.append(cur)
+            cur = {}
+            continue
+        key, _, val = line.partition(" ")
+        if key == "worktree":
+            cur = {"path": val, "branch": "", "detached": False, "locked": False}
+        elif key == "branch":
+            cur["branch"] = val.replace("refs/heads/", "", 1)
+        elif key == "detached":
+            cur["detached"] = True
+        elif key == "locked":
+            cur["locked"] = True
+        elif key == "HEAD":
+            cur["head"] = val
+    for w in out:
+        p = Path(w["path"])
+        w["main"] = p.resolve() == main.resolve()
+        w["haam_area"] = any(a == p.resolve() or a in p.resolve().parents for a in areas)
+        w["exists"] = p.exists()
+    return out
+
+
+class ShippedWork:
+    """Where a commit reached main, read once per `worktree clean`. A squash merge never makes a branch's tip an
+    ancestor of main, and with grouping: release an issue branch has no merged PR of its own (its commit went in
+    through the release PR), and its branch may stay on origin. So a commit counts as shipped when it is an
+    ancestor of main or of a merged PR's head. A merged PR's head that isn't here is fetched as pull/<n>/head."""
+
+    def __init__(self, main, base, cfg=None):
+        self.main, self.base, self.cfg = main, base, cfg or {}
+        self._commits = None
+
+    def _load(self):
+        self._commits = {}
+        cmd = ["gh", "pr", "list", "--state", "merged", "--limit", str(WORKTREE_MERGED_PRS),
+               "--json", "number,headRefOid,mergedAt"]
+        if self.cfg.get("github_repo"):
+            cmd += ["-R", self.cfg["github_repo"]]
+        code, out, _ = run(cmd, cwd=self.main)
+        try:
+            prs = [p for p in (json.loads(out or "[]") if code == 0 else []) if p.get("headRefOid")]
+        except ValueError:
+            prs = []
+        prs.sort(key=lambda p: p.get("mergedAt") or "", reverse=True)
+        missing = self._missing([p["headRefOid"] for p in prs])
+        if missing:     # deleted branches (a release branch, usually): GitHub keeps every PR's head as pull/<n>/head
+            run(["git", "fetch", "--quiet", "--no-tags", "origin"]
+                + [f"pull/{p['number']}/head" for p in prs if p["headRefOid"] in missing], cwd=self.main)
+            missing = self._missing(list(missing))
+        for p in reversed(prs):     # oldest first, so a commit in several PRs maps to the newest
+            if p["headRefOid"] in missing:
+                continue
+            for sha in git_out(self.main, "rev-list", p["headRefOid"], "--not", self.base).split():
+                self._commits[sha] = f"PR #{p['number']}"
+
+    def _missing(self, shas):
+        """The commits among `shas` this clone doesn't have (one git call for all of them)."""
+        if not shas:
+            return set()
+        _, out, _ = run(["git", "cat-file", "--batch-check"], cwd=self.main, input_text="\n".join(shas) + "\n")
+        return {line.split()[0] for line in out.splitlines() if line.endswith(" missing")}
+
+    def where(self, sha):
+        """'main', 'PR #<n>', or None when the commit isn't in main or in any recent merged PR."""
+        if not sha:
+            return None
+        if run(["git", "merge-base", "--is-ancestor", sha, self.base], cwd=self.main)[0] == 0:
+            return "main"
+        if self._commits is None:
+            self._load()
+        return self._commits.get(sha)
+
+
+def worktree_finished(main, w, base, in_use=None, cfg=None, shipped=None):
+    """Decide whether a worktree can be removed without losing anything. Returns (ok, reason).
+    `shipped` (a ShippedWork) lets a worktree whose commit already reached main through a merged PR go, even
+    while its branch is still on origin."""
+    p = Path(w["path"])
+    if w["main"]:
+        return False, "main folder"
+    if in_use and w["exists"]:
+        here = os.path.realpath(p)
+        if any(u == here or u.startswith(here + os.sep) for u in in_use):
+            return False, "a program is running in it (an agent chat or a terminal?)"
+    if not w["haam_area"]:
+        label = worktree_dir_label(cfg)
+        return False, (f"outside {label} (made by hand, or under an older rule: `worktree clean --also "
+                       f"{p.parent}` checks the worktrees in that folder too)")
+    if w["locked"]:
+        return False, "locked (an agent is using it)"
+    if not w["exists"]:
+        return True, "folder already gone (prune)"
+    # Last use, read before `git status` (which can rewrite the index and so reset its time)
+    idx = Path(git_out(p, "rev-parse", "--absolute-git-dir") or p) / "index"
+    idle = (time.time() - (idx.stat().st_mtime if idx.exists() else 0)) / 3600
+    changes = git_out(p, "--no-optional-locks", "status", "--porcelain")     # never rewrites the index (its time)
+    if changes:
+        return False, f"{len(changes.splitlines())} unsaved change(s)"
+    unpushed = git_out(p, "rev-list", "--count", "HEAD", "--not", "--remotes") or "0"
+    own = git_out(p, "rev-list", "--count", f"{base}..HEAD") or "0"
+    pushed_before = bool(w["branch"]) and bool(git_out(p, "config", "--get", f"branch.{w['branch']}.merge"))
+    where = None
+    if shipped is not None and (own != "0" or pushed_before):
+        where = shipped.where(w.get("head") or git_out(p, "rev-parse", "HEAD"))
+        if where and idle >= WORKTREE_IDLE_HOURS:
+            return True, f"its work is in {where} (shipped) and it's been unused for {int(idle)}h"
+    waiting = f"its work is in {where} (shipped); removed once unused for {WORKTREE_IDLE_HOURS}h"
+    if pushed_before:
+        code, out, _ = run(["git", "ls-remote", "--heads", "origin", w["branch"]], cwd=main)
+        if code != 0:
+            return False, "couldn't reach origin to check the branch"
+        if out:
+            return False, waiting if where else f"branch {w['branch']} still on origin (PR open?)"
+        if unpushed == "0":
+            return True, f"branch {w['branch']} is gone from origin (PR merged or closed)"
+        code, prs, _ = run(["gh", "pr", "list", "--head", w["branch"], "--state", "all",
+                            "--json", "state,headRefOid"], cwd=main)
+        try:
+            done = any(pr["state"] in ("MERGED", "CLOSED") and pr["headRefOid"] == w.get("head")
+                       for pr in json.loads(prs or "[]")) if code == 0 else False
+        except ValueError:
+            done = False
+        if done:
+            return True, f"PR for {w['branch']} is merged or closed"
+        return False, f"branch gone from origin but {unpushed} commit(s) aren't on GitHub; check before removing"
+    if unpushed != "0":
+        return False, f"{unpushed} commit(s) not pushed"
+    if own == "0" and idle >= WORKTREE_IDLE_HOURS:
+        return True, f"nothing of its own and unused for {int(idle)}h"
+    return False, waiting if where else "in use or recently created"
+
+
+def cmd_worktree(args):
+    root = find_repo_root(Path.cwd())
+    top, main, linked = git_paths(root)
+    cfg = load_config(main) if (main / CONFIG_NAME).exists() else {}
+    act = args.action
+    area = worktree_base(main, cfg)
+    area_label = worktree_dir_label(cfg)
+
+    if act == "status":
+        info = {"in_worktree": linked, "path": str(top), "main_folder": str(main),
+                "worktree_dir": area_label, "worktree_path": str(area),
+                "branch": git_out(top, "branch", "--show-current") or "(detached)",
+                "worktrees": len([w for w in list_worktrees(root, cfg) if not w["main"]]),
+                "worktreeinclude": (main / WORKTREE_INCLUDE).exists()}
+        if args.json:
+            print(json.dumps(info, indent=2))
+            return
+        if linked:
+            print(f"{OK} This chat has its own worktree: {top}")
+        else:
+            print(f"{WARN} This is the main folder ({top}).")
+            print("   Agent chats that change code should each get their own worktree: run /work,")
+            print("   or `python3 tools/haam/haam.py worktree new` and open the folder it prints.")
+        print(f"   Branch: {info['branch']} · other worktrees: {info['worktrees']} · area: {area_label}")
+        return
+
+    if act == "new":
+        name = args.name or f"agent-{os.urandom(2).hex()}"
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,60}", name):
+            sys.exit("Use letters, numbers, dots, dashes or underscores for the name.")
+        area.mkdir(parents=True, exist_ok=True)
+        dest = area / name
+        if dest.exists():
+            sys.exit(f"{dest} already exists. Open it, or pick another name.")
+        run(["git", "fetch", "--quiet", "origin"], cwd=main)
+        base = args.base or default_base(main)
+        code, _, err = run(["git", "worktree", "add", "--quiet", "--detach", str(dest), base], cwd=main)
+        if code != 0:
+            sys.exit(f"Couldn't create the worktree: {err}")
+        copied, skipped = copy_includes(main, dest, cfg)
+        res = {"path": str(dest), "base": base, "copied": copied, "skipped": skipped}
+        if args.json:
+            print(json.dumps(res, indent=2))
+            return
+        print(f"{OK} New worktree: {dest}  (from {base})")
+        if copied:
+            print(f"{OK} Copied from the main folder: {', '.join(copied)}")
+        for s_ in skipped:
+            print(f"{WARN} Not copied: {s_}")
+        print("Next: open that folder in a new window, start your agent there and run /work"
+              " (Codex: $work). Dependencies: run `make setup` there once.")
+        return
+
+    if act == "prep":
+        copied, skipped = copy_includes(main, top, cfg)
+        hooks_on = secret_hook_on(top)
+        if args.json:
+            print(json.dumps({"in_worktree": linked, "copied": copied, "skipped": skipped,
+                              "secret_hook_on": hooks_on, "worktree_dir": area_label}, indent=2))
+            return
+        if not hooks_on:
+            print(f"{WARN} The git secret hook is off for this repository: run `make hooks` (once per clone).")
+        if not linked:
+            print(f"{INFO} This is the main folder; nothing to copy.")
+        elif not include_patterns(main):
+            print(f"{WARN} No {WORKTREE_INCLUDE} in the main folder, so no local files (like .env) were copied.")
+        else:
+            print(f"{OK} Local files copied: {', '.join(copied) if copied else 'none needed'}")
+        for s_ in skipped:
+            print(f"{WARN} Not copied: {s_}")
+        return
+
+    base = default_base(main)
+    trees = list_worktrees(root, cfg, getattr(args, "also", None))
+    if act == "list":
+        if args.json:
+            print(json.dumps(trees, indent=2))
+            return
+        for w in trees:
+            label = "main folder" if w["main"] else (w["branch"] or "(detached)")
+            changes = git_out(Path(w["path"]), "status", "--porcelain") if w["exists"] else ""
+            extra = f" · {len(changes.splitlines())} unsaved change(s)" if changes else ""
+            extra += " · locked" if w["locked"] else ""
+            print(f"  {w['path']}  [{label}]{extra}")
+        return
+
+    if act == "clean":
+        run(["git", "fetch", "--quiet", "origin"], cwd=main)
+        rep = Report()
+        rep.section("Worktrees")
+        remove = []
+        in_use = paths_in_use()
+        shipped = ShippedWork(main, base, cfg)
+        for w in trees:
+            if w["main"]:
+                continue
+            ok, why = worktree_finished(main, w, base, in_use, cfg, shipped)
+            rep.add("ok" if ok else "info", f"{'remove' if ok else 'keep'}: {w['path']}", why)
+            if ok:
+                remove.append(w)
+        if not remove:
+            rep.add("ok", "Nothing to clean")
+        elif not args.apply:
+            rep.action(WHO_AGENT, f"Remove {len(remove)} finished worktree(s)",
+                       "python3 tools/haam/haam.py worktree clean --apply"
+                       + "".join(f" --also {shlex.quote(a)}" for a in getattr(args, "also", None) or []))
+        else:
+            for w in remove:
+                if Path(w["path"]).exists():
+                    code, _, err = run(["git", "worktree", "remove", w["path"]], cwd=main)
+                    rep.add("ok" if code == 0 else "warn", f"removed {w['path']}" if code == 0 else
+                            f"couldn't remove {w['path']}", err[:160])
+            run(["git", "worktree", "prune"], cwd=main)
+        rep.print(args.json)
+        return
+
+
+# ----------------------------------------------------------------------------- exclusive (one heavy run at a time)
+
+EXCLUSIVE_LOCK = "haam-exclusive.lock"
+EXCLUSIVE_QUEUE = "haam-exclusive.lock.queue"   # one ticket per waiter, so the lock goes to the longest-waiting
+EXCLUSIVE_SELF = re.compile(r"haam\.py['\"]?\s+exclusive(\s|$)")
+EXCLUSIVE_HELD_ENV = "HAAM_EXCLUSIVE_HELD"       # "<pid>@<lock>", set for everything the lock's holder runs
+REMOTE_RUNNER_ENV = "HAAM_REMOTE_RUNNER"         # an ssh host this machine may hand heavy `make` runs to
+REMOTE_REPO_ENV = "HAAM_REMOTE_REPO"             # the clone's path there (default: this clone's path under ~)
+REMOTE_CHECK_SECONDS = 60.0
+# A stuck run must not hold a machine for days (#1796: the Mac Studio's lock was held from 4 Nov to 13 Nov by a run
+# with under a second of CPU, and nobody was told). The longest full check seen took 97 minutes.
+LONG_HOLD_MINUTES = 180.0       # a lock held longer than this is said in the waiting line, in doctor, and once on the issue
+REMOTE_MAX_RUN_MINUTES = 180.0  # a run sent to the other machine is stopped there after this long (--max-run changes it)
+RUN_CEILING_EXIT = 125          # what exclusive exits with when it stopped its command at --max-run
+EXCLUSIVE_STOPPED = "haam-exclusive.stopped"    # JSON lines: the runs this clone's exclusive stopped at their ceiling
+EXCLUSIVE_NOTICED = "haam-exclusive.noticed"    # the notices already posted from this clone, so each is posted once
+NOTICE_ENV = "HAAM_EXCLUSIVE_NOTICE"             # "off": don't comment on issues (a run sent here by another machine)
+# One JSON line per run beside the lock, so "is the queue a bottleneck?" has numbers (`exclusive --report`). Past
+# EXCLUSIVE_LOG_MAX_BYTES it is cut to its last EXCLUSIVE_LOG_KEEP lines: weeks of runs even on a busy machine.
+EXCLUSIVE_LOG = "haam-exclusive.log.jsonl"
+EXCLUSIVE_LOG_MAX_BYTES = 1_000_000
+EXCLUSIVE_LOG_KEEP = 3000
+
+
+class RemoteTurn(Exception):
+    """Raised inside `MachineTurn` when the remote runner is free before this machine's turn comes. `place` is the
+    name its ticket had: a run that comes back waits here under it again, so it keeps its place in line (#924)."""
+
+    def __init__(self, place=None):
+        super().__init__()
+        self.place = place
+
+
+def process_table():
+    """[(pid, ppid, pgid, command)] for every process on this machine, or None where ps isn't available."""
+    try:
+        p = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,ppid=,pgid=,command="], capture_output=True, text=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    rows = []
+    for line in p.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 3:
+            continue
+        try:
+            rows.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3] if len(parts) > 3 else ""))
+        except ValueError:
+            continue
+    return rows
+
+
+def compile_patterns(patterns):
+    out = []
+    for pat in patterns or []:
+        try:
+            out.append(re.compile(pat))
+        except re.error:
+            out.append(re.compile(re.escape(pat)))
+    return out
+
+
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+
+
+def run_line(command):
+    """What a process itself runs, for heavy_runs to match (#1039): its own program and arguments.
+
+    A shell given a command string (`zsh -c '…'`, `bash -lc …`) runs nothing heavy itself, whatever the string
+    mentions: a heavy command it starts is a process of its own, and is matched as one. Matching the shell's text
+    deadlocked the queue twice (23 and 26 Oct 2026): a watcher loop reading a log named `./gradlew check`, and a
+    waiter's own wrapper named its test command. A shell running a script file runs that script. None when the
+    process runs nothing to match."""
+    words = command.split()
+    if not words:
+        return None
+    if Path(words[0].lstrip("-")).name not in SHELLS:
+        return command
+    rest = words[1:]
+    while rest and rest[0][:1] in "-+" and rest[0] not in ("-", "--"):
+        flag = rest.pop(0)
+        if not flag.startswith("--") and "c" in flag[1:]:
+            return None
+        if flag in ("-o", "+o", "-O", "+O") and rest:
+            rest.pop(0)
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    return " ".join(rest) or None
+
+
+def heavy_runs_now(patterns):
+    """Other processes matching the project's heavy_runs: never this process, its process group or its ancestors,
+    and never another `haam.py exclusive` (it waits for the lock, or holds it, so it isn't running anything free).
+    Each is matched by what it runs itself (`run_line`), never by a shell's command text."""
+    regs = compile_patterns(patterns)
+    rows = process_table()
+    if not regs or rows is None:
+        return []
+    parent = {pid: ppid for pid, ppid, _, _ in rows}
+    skip, x = set(), os.getpid()
+    while x and x not in skip:
+        skip.add(x)
+        x = parent.get(x)
+    try:
+        group = os.getpgid(0)
+    except (AttributeError, OSError):
+        group = None
+    found = []
+    for pid, _, pgid, cmd in rows:
+        line = run_line(cmd)
+        if pid in skip or pgid == group or line is None or EXCLUSIVE_SELF.search(line):
+            continue
+        if any(r.search(line) for r in regs):
+            found.append((pid, line))
+    return found
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+def lock_age_seconds(owner, owner_file=None):
+    """How long a lock's holder has held it, from its `since` (local time where it was written) or the file's age."""
+    try:
+        return max(0.0, time.time() - time.mktime(time.strptime(owner.get("since", ""), "%Y-%m-%d %H:%M:%S")))
+    except (ValueError, OverflowError, AttributeError):
+        pass
+    try:
+        return max(0.0, time.time() - Path(owner_file).stat().st_mtime) if owner_file else None
+    except OSError:
+        return None
+
+
+def held_long(age_s):
+    return age_s is not None and age_s > LONG_HOLD_MINUTES * 60
+
+
+def say_age(age_s):
+    h = int(age_s // 3600)
+    return f"{h // 24} d {h % 24} h" if h >= 24 else f"{h} h {int(age_s % 3600 // 60)} min"
+
+
+def descendants(pid):
+    """Every process below `pid` on this machine, children first."""
+    kids = {}
+    for p, pp, _, _ in process_table() or []:
+        kids.setdefault(pp, []).append(p)
+    out, todo = [], [pid]
+    while todo:
+        for c in kids.get(todo.pop(0), []):
+            out.append(c)
+            todo.append(c)
+    return out
+
+
+def stop_tree(child):
+    """End a command and everything it started: TERM, ten seconds, then KILL for whatever is left."""
+    pids = [child.pid] + descendants(child.pid)
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    for p in pids:
+        if pid_alive(p):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+    child.wait()
+
+
+def record_stopped(lock, record):
+    """Keep what a ceiling stopped beside the lock (the last 20), so a machine that couldn't comment is still heard:
+    the other machine reads it in its next check and posts it once."""
+    f = lock.with_name(EXCLUSIVE_STOPPED)
+    try:
+        lines = f.read_text().splitlines()[-19:] if f.exists() else []
+        f.write_text("\n".join(lines + [json.dumps(record)]) + "\n")
+    except OSError:
+        pass
+
+
+def now_stamp():
+    """Local time with its offset, to the second (parsed back by datetime.fromisoformat)."""
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def short_host():
+    return socket.gethostname().split(".")[0]
+
+
+def log_run(lock, rec):
+    """Add one run's line to the log beside the lock (EXCLUSIVE_LOG). Never fails the run it records: a log that
+    can't be written is skipped. Past EXCLUSIVE_LOG_MAX_BYTES the file keeps its last EXCLUSIVE_LOG_KEEP lines."""
+    f = lock.with_name(EXCLUSIVE_LOG)
+    tmp = None
+    try:
+        with open(f, "a", encoding="utf-8") as out:     # one short append: lines from parallel runs don't mix
+            out.write(json.dumps(rec) + "\n")
+        if f.stat().st_size > EXCLUSIVE_LOG_MAX_BYTES:
+            keep = f.read_text(encoding="utf-8", errors="replace").splitlines()[-EXCLUSIVE_LOG_KEEP:]
+            tmp = f.with_name(f"{f.name}.trim-{os.getpid()}")
+            tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            os.replace(tmp, f)
+            tmp = None
+    except Exception:   # noqa: BLE001 - the log is a by-product; the run's own exit code is what matters
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def read_run_log(lock):
+    """The log's runs, oldest first; lines that aren't JSON objects are skipped."""
+    try:
+        text = lock.with_name(EXCLUSIVE_LOG).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    runs = []
+    for line in text.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and isinstance(rec.get("asked"), str):
+            runs.append(rec)
+    return runs
+
+
+def _stamp(s):
+    try:
+        return datetime.datetime.fromisoformat(s) if isinstance(s, str) else None
+    except ValueError:
+        return None
+
+
+def _seconds(a, b):
+    a, b = _stamp(a), _stamp(b)
+    if a is None or b is None or (a.tzinfo is None) != (b.tzinfo is None):
+        return None
+    return max(0.0, (b - a).total_seconds())
+
+
+def run_log_summary(runs, days=7, today=None):
+    """Per local day (of `asked`) over the last `days` days, and in total: runs, wait (started − asked) and run time
+    (ended − started) medians and maxima in seconds, and how many ran on the remote runner, gave up waiting (124,
+    nothing started), were stopped at their ceiling, and failed on the remote runner and then passed here on the
+    same head commit and command (the runner, not the change, was likely broken). Nested runs (straight through
+    inside their parent's turn) are left out of everything but their own count, so no wait is counted twice."""
+    today = today or datetime.date.today()
+    first = (today - datetime.timedelta(days=max(1, days) - 1)).isoformat()
+    last_pass = {}      # (head, command) -> the log index of its last pass here
+    for i, r in enumerate(runs):
+        if not r.get("remote") and not r.get("nested") and r.get("exit") == 0 and r.get("started") and r.get("head"):
+            last_pass[(r["head"], r.get("command"))] = i
+    broke = {i for i, r in enumerate(runs)      # a failure there, then a pass here, later in the log
+             if r.get("remote") and r.get("exit") not in (0, None) and not r.get("nested")
+             and last_pass.get((r.get("head"), r.get("command")), -1) > i}
+
+    def stats(group):
+        main = [(i, r) for i, r in group if not r.get("nested")]
+        waits = [w for w in (_seconds(r.get("asked"), r.get("started")) for _, r in main) if w is not None]
+        times = [t for t in (_seconds(r.get("started"), r.get("ended")) for _, r in main) if t is not None]
+
+        def med(xs):
+            xs = sorted(xs)
+            n = len(xs)
+            return round((xs[n // 2] + xs[(n - 1) // 2]) / 2, 1) if xs else None
+        return {"runs": len(main), "nested": len(group) - len(main),
+                "wait_median_s": med(waits), "wait_max_s": round(max(waits), 1) if waits else None,
+                "run_median_s": med(times), "run_max_s": round(max(times), 1) if times else None,
+                "remote": sum(1 for _, r in main if r.get("remote")),
+                "gave_up": sum(1 for _, r in main if not r.get("started") and r.get("exit") == 124),
+                "stopped": sum(1 for _, r in main if r.get("stopped")),
+                "failed_there_passed_here": sum(1 for i, _ in main if i in broke)}
+
+    window = [(i, r) for i, r in enumerate(runs) if r["asked"][:10] >= first]
+    by_day = {}
+    for i, r in window:
+        by_day.setdefault(r["asked"][:10], []).append((i, r))
+    return {"days": days, "since": first, "per_day": [dict(day=d, **stats(by_day[d])) for d in sorted(by_day)],
+            "total": stats(window)}
+
+
+def say_seconds(s):
+    if s is None:
+        return "-"
+    s = int(round(s))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{s % 3600 // 60:02d}m"
+
+
+def print_run_report(summary, where):
+    if not summary["per_day"]:
+        print(f"No heavy runs logged here in the last {summary['days']} days ({where}).")
+        return
+    print(f"Heavy runs through exclusive on this machine, the last {summary['days']} days ({where}).")
+    print("Wait: from asking to starting. Run: from starting to the end. Nested runs are left out.")
+    cols = [("Day", "day", 10), ("Runs", "runs", 4), ("Wait med", "wait_median_s", 8), ("Wait max", "wait_max_s", 8),
+            ("Run med", "run_median_s", 7), ("Run max", "run_max_s", 7), ("Remote", "remote", 6),
+            ("Gave up", "gave_up", 7), ("Stopped", "stopped", 7), ("Failed there, passed here", "failed_there_passed_here", 25)]
+
+    def row(d):
+        cells = []
+        for _title, key, width in cols:
+            v = d.get(key)
+            v = say_seconds(v) if key.endswith("_s") else v
+            cells.append(str(v).ljust(width) if key == "day" else str(v).rjust(width))
+        return "  ".join(cells)
+    print("  ".join(t.ljust(w) if k == "day" else t.rjust(w) for t, k, w in cols))
+    for d in summary["per_day"]:
+        print(row(d))
+    print(row(dict(summary["total"], day="All")))
+
+
+def post_notice(cfg, lock, key, who, body, say):
+    """Comment `body` once on the issue `who` names (#123), from this clone. Never fails the run it reports."""
+    m = re.search(r"#(\d+)", who or "")
+    if not m or os.environ.get(NOTICE_ENV) == "off":
+        return
+    marker = lock.with_name(EXCLUSIVE_NOTICED)
+    try:
+        seen = json.loads(marker.read_text()) if marker.exists() else []
+    except (OSError, ValueError):
+        seen = []
+    if key in seen:
+        return
+    repo = (cfg or {}).get("github_repo")
+    if (cfg or {}).get("tracker", "github") != "github" or not repo or not have("gh"):
+        say(f"{WARN} Couldn't tell #{m.group(1)} (no GitHub tracker or gh here): {body.splitlines()[0]}")
+        return
+    try:
+        p = subprocess.run(["gh", "issue", "comment", m.group(1), "-R", repo, "--body", body],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        p = None
+    if p is None or p.returncode != 0:
+        say(f"{WARN} Couldn't comment on #{m.group(1)}: {((p.stderr if p else '') or 'gh failed').strip()[:160]}")
+        return
+    try:
+        marker.write_text(json.dumps((seen + [key])[-200:]) + "\n")
+    except OSError:
+        pass
+    say(f"{INFO} Told the owner on #{m.group(1)}.")
+
+
+def long_hold_body(owner, where, age_s):
+    return (f"⏳ `haam.py exclusive`: the heavy-run lock on {where} has been held since {owner.get('since', '?')} "
+            f"({say_age(age_s)}) by \"{owner.get('who', '?')}\" (pid {owner.get('pid', '?')}), far longer than any "
+            "check takes, and every other run waits for it. Nothing stops it automatically: check whether that run "
+            "still makes progress (its CPU time against its elapsed time: `ps -o pid,etime,time,command -p <pid>`), "
+            "and stop it on the owner's word.")
+
+
+def stopped_body(rec):
+    return (f"⏱️ `haam.py exclusive` stopped a heavy run for this issue at its ceiling on {rec.get('host', '?')}: "
+            f"`{rec.get('command', '?')}`, started {rec.get('since', '?')} by \"{rec.get('who', '?')}\", ran "
+            f"{rec.get('minutes', '?')} min without finishing. The machine's lock is free again. Its result is unknown: "
+            "run it again, and if it stops again, find what hangs.")
+
+
+def exclusive_lock_path(cwd=None):
+    """The lock lives in the repository's common git directory, so every worktree of this clone shares it."""
+    cwd = Path(cwd or Path.cwd())
+    common = git_out(cwd, "rev-parse", "--git-common-dir")
+    if not common:
+        sys.exit("haam.py exclusive runs inside the project's git repository (or one of its worktrees).")
+    return (cwd / common).resolve() / EXCLUSIVE_LOCK
+
+
+class MachineTurn:
+    """`with MachineTurn(who, patterns):` waits for the machine-wide lock, then for a quiet spell with no other heavy
+    run, and always releases the lock on the way out (success, failure, Ctrl-C, kill).
+
+    Waiters take turns in order: each writes a ticket in `<common git dir>/haam-exclusive.lock.queue/` and tries the
+    lock only when its ticket is the oldest one whose process is still alive. A copy of haam.py from before tickets
+    (no ticket) still takes the lock whenever it is free; the ticket order holds among the others.
+
+    `remote_free`, when given, is asked every REMOTE_CHECK_SECONDS while this machine's lock is busy; when it says
+    yes, the wait ends with `RemoteTurn` (the ticket is withdrawn first, so the line here moves on while the run is
+    away). `place`, a ticket name from that `RemoteTurn`, queues under that name again instead of a new one."""
+
+    def __init__(self, who, patterns, timeout_min=60.0, quiet_s=10.0, say=print, cwd=None, remote_free=None,
+                 place=None, on_long_hold=None):
+        self.who, self.patterns, self.say = who, patterns, say
+        self.deadline = time.time() + timeout_min * 60
+        self.quiet = quiet_s
+        self.poll = min(2.0, max(0.2, quiet_s / 4)) if quiet_s else 0.5
+        self.lock = exclusive_lock_path(cwd)
+        self.queue = self.lock.with_name(EXCLUSIVE_QUEUE)
+        self.ticket = None
+        self.place = place
+        self.remote_free = remote_free
+        self.on_long_hold = on_long_hold     # called once with (owner, age in seconds) for a lock held past LONG_HOLD
+        self.held = False
+        self.nested = False
+        self._old = {}
+        # What this turn last waited for, said when it gives up (#1039): the lock's owner, runs ahead, or heavy runs.
+        self.blocking = []
+        self._old_env = None
+
+    def _owner(self):
+        try:
+            return json.loads((self.lock / "owner").read_text())
+        except (OSError, ValueError):
+            return None
+
+    def _enqueue(self):
+        try:
+            self.queue.mkdir(exist_ok=True)
+            t = self.queue / (self.place or f"{time.time_ns():020d}-{os.getpid()}")
+            t.write_text(json.dumps({"who": self.who, "pid": os.getpid(),
+                                     "since": time.strftime("%Y-%m-%d %H:%M:%S")}) + "\n")
+            self.ticket = t
+        except OSError:
+            self.ticket = None      # no ticket: fall back to taking the lock whenever it is free
+
+    def _dequeue(self):
+        if self.ticket is not None:
+            try:
+                self.ticket.unlink()
+            except OSError:
+                pass
+            self.ticket = None
+
+    def _away(self):
+        place = self.ticket.name if self.ticket is not None else None
+        self._dequeue()
+        raise RemoteTurn(place)
+
+    def _ahead(self):
+        """Live tickets older than this one, oldest first; a dead process's ticket is removed on the way."""
+        if self.ticket is None:
+            return []
+        try:
+            names = sorted(p.name for p in self.queue.iterdir())
+        except OSError:
+            return []
+        ahead = []
+        for name in names:
+            if name == self.ticket.name:
+                break
+            pid = name.rsplit("-", 1)[-1]
+            if pid.isdigit() and not pid_alive(int(pid)):
+                try:
+                    (self.queue / name).unlink()
+                except OSError:
+                    pass
+                continue
+            ahead.append(name)
+        return ahead
+
+    def _inside_holder(self):
+        """The lock's holder started this run (a check script that takes the lock for its heavy steps, run through
+        exclusive itself). It already has the machine: waiting would wait for its own parent until the timeout,
+        with every other chat queued behind. Known by HAAM_EXCLUSIVE_HELD, or by the holder's pid among this
+        process's ancestors when something cleared the environment."""
+        owner = self._owner()
+        if not owner or owner.get("host") != (os.uname().nodename if hasattr(os, "uname") else ""):
+            return None
+        try:
+            pid = int(owner.get("pid") or 0)
+        except (TypeError, ValueError):
+            return None
+        if pid <= 0 or not pid_alive(pid):
+            return None
+        if os.environ.get(EXCLUSIVE_HELD_ENV) == f"{pid}@{self.lock}":
+            return owner
+        parent = {p_: pp for p_, pp, _, _ in process_table() or []}
+        x, seen = os.getppid(), set()
+        while x and x not in seen:
+            if x == pid:
+                return owner
+            seen.add(x)
+            x = parent.get(x)
+        return None
+
+    def _acquire(self):
+        told, told_ahead, next_remote, told_long = False, None, 0.0, None
+        holder = self._inside_holder()
+        if holder:
+            self.nested = True
+            self.say(f"{INFO} {self.who}: inside {holder.get('who', '?')}'s turn (pid {holder.get('pid')}), "
+                     "which already holds the machine: running straight through.")
+            return True
+        self._enqueue()
+        while True:
+            ahead = self._ahead()
+            if ahead:
+                self.blocking = [f"{len(ahead)} run(s) ahead in line"]
+                if len(ahead) != told_ahead:
+                    self.say(f"{INFO} In line for the machine: {len(ahead)} run(s) ahead of {self.who}.")
+                    told_ahead = len(ahead)
+                if self.remote_free is not None and time.time() >= next_remote:
+                    next_remote = time.time() + REMOTE_CHECK_SECONDS
+                    if self.remote_free():
+                        self._away()
+                if time.time() > self.deadline:
+                    self._dequeue()
+                    return False
+                time.sleep(self.poll)
+                continue
+            try:
+                os.mkdir(self.lock)
+            except FileExistsError:
+                owner = self._owner()
+                stale = (owner and owner.get("host") == os.uname().nodename and not pid_alive(int(owner.get("pid") or 0))
+                         if hasattr(os, "uname") else False)
+                if owner is None:
+                    try:
+                        stale = time.time() - self.lock.stat().st_mtime > 30
+                    except OSError:
+                        continue
+                if stale:
+                    junk = self.lock.with_name(f"{EXCLUSIVE_LOCK}.stale-{os.getpid()}")
+                    try:
+                        os.rename(self.lock, junk)
+                        shutil.rmtree(junk, ignore_errors=True)
+                        self.say(f"{INFO} Took over a lock left behind by {(owner or {}).get('who', 'a run that ended')}.")
+                    except OSError:
+                        pass
+                    continue
+                self.blocking = [f"the lock, held by {owner.get('who', '?')} (pid {owner.get('pid', '?')}, "
+                                 f"since {owner.get('since', '?')})"]
+                if not told:
+                    self.say(f"{INFO} Waiting for {owner.get('who', '?')} (running since {owner.get('since', '?')}, "
+                             f"pid {owner.get('pid', '?')}) to finish…")
+                    told = True
+                age = lock_age_seconds(owner, self.lock / "owner")
+                key = (owner.get("pid"), owner.get("since"))
+                if held_long(age) and told_long != key:
+                    told_long = key
+                    self.say(f"{WARN} This machine's lock has been held since {owner.get('since', '?')} "
+                             f"({say_age(age)}) by {owner.get('who', '?')}, far longer than any check takes.")
+                    if self.on_long_hold is not None:
+                        self.on_long_hold(owner, age)
+                if self.remote_free is not None and time.time() >= next_remote:
+                    next_remote = time.time() + REMOTE_CHECK_SECONDS
+                    if self.remote_free():
+                        self._away()
+                if time.time() > self.deadline:
+                    self._dequeue()
+                    return False
+                time.sleep(self.poll)
+                continue
+            (self.lock / "owner").write_text(json.dumps({
+                "who": self.who, "pid": os.getpid(), "host": os.uname().nodename if hasattr(os, "uname") else "",
+                "since": time.strftime("%Y-%m-%d %H:%M:%S")}) + "\n")
+            self.held = True
+            self._old_env = os.environ.get(EXCLUSIVE_HELD_ENV)   # what this run starts inherits it (nested calls)
+            os.environ[EXCLUSIVE_HELD_ENV] = f"{os.getpid()}@{self.lock}"
+            self._dequeue()     # holding the lock now: the next ticket in line waits for it
+            return True
+
+    def _wait_quiet(self):
+        if not self.patterns:
+            return True
+        quiet_since, told = None, False
+        while True:
+            busy = heavy_runs_now(self.patterns)
+            now = time.time()
+            if busy:
+                quiet_since = None
+                self.blocking = [f"pid {pid}: {cmd[:120]}" for pid, cmd in busy[:3]]
+                if not told:
+                    self.say(f"{INFO} Waiting for {len(busy)} other heavy run(s) that don't use the lock: "
+                             + "; ".join(f"pid {pid}: {cmd[:80]}" for pid, cmd in busy[:3]))
+                    told = True
+            elif quiet_since is None:
+                quiet_since = now
+            if quiet_since is not None and now - quiet_since >= self.quiet:
+                return True
+            if now > self.deadline:
+                return False
+            time.sleep(self.poll)
+
+    def release(self):
+        self._dequeue()
+        if self.held:
+            owner = self._owner()
+            if not owner or owner.get("pid") == os.getpid():
+                shutil.rmtree(self.lock, ignore_errors=True)
+            self.held = False
+            if self._old_env is None:
+                os.environ.pop(EXCLUSIVE_HELD_ENV, None)
+            else:
+                os.environ[EXCLUSIVE_HELD_ENV] = self._old_env
+            self._old_env = None
+
+    def _on_signal(self, signum, _frame):
+        raise SystemExit(128 + signum)
+
+    def __enter__(self):
+        for sig in ("SIGTERM", "SIGHUP"):
+            if hasattr(signal, sig):
+                self._old[sig] = signal.signal(getattr(signal, sig), self._on_signal)
+        try:
+            if not self._acquire() or (not self.nested and not self._wait_quiet()):
+                raise TimeoutError
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        for sig, old in self._old.items():
+            signal.signal(getattr(signal, sig), old)
+        self._old = {}
+        return False
+
+
+def remote_eligible(command):
+    """Only `make <targets>` goes to another machine: a chat's own script may name paths that exist only here."""
+    if not command or Path(command[0]).name not in ("make", "gmake"):
+        return False
+    return all(not (a.startswith(("/", "~", "-C", "--directory", "-f", "--file")) or "/" in a.split("=", 1)[0])
+               for a in command[1:])
+
+
+def remote_repo_default(root):
+    """This clone's main folder, written relative to ~ so the same layout works on the other machine."""
+    common = git_out(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    main = Path(common).parent if common else root
+    try:
+        return str(main.relative_to(Path.home()))
+    except ValueError:
+        return str(main)
+
+
+def ssh_args(host):
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=60", host]
+
+
+# Sent to the other machine as a script of its own (that machine may run an older haam.py, or none outside a run).
+# It answers in JSON: the lock's live holder with its age, the live waiters, and the runs a ceiling stopped there.
+# A holder or a ticket whose process is gone counts as nothing (#1807): that machine's own exclusive takes a lock
+# left behind over, and drops a dead ticket, the moment it runs.
+# Given a tool (its second argument) and a free lock, it also runs `<tool> --version` in the login zsh a run there
+# uses, and answers `not_ready` with the first error line when that fails (kit #20): a new Xcode whose licence nobody
+# accepted makes every `make` exit 69, and a run handed over would fail at once and, by #924, never run here again.
+REMOTE_PROBE = r"""
+import json, os, subprocess, sys, time
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+repo = sys.argv[1] if os.path.isabs(sys.argv[1]) else os.path.join(os.path.expanduser("~"), sys.argv[1])
+try:
+    os.chdir(repo)
+    d = os.path.abspath(subprocess.run(["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True,
+                                       check=True).stdout.strip())
+except Exception:
+    sys.exit(3)
+lock, out = os.path.join(d, "%(lock)s"), {"holder": None, "waiting": 0, "stopped": []}
+if os.path.isdir(lock):
+    f = os.path.join(lock, "owner")
+    try:
+        owner = json.load(open(f))
+        pid = int(owner.get("pid") or 0)
+    except Exception:
+        owner, pid = None, 0
+    try:
+        age = time.time() - time.mktime(time.strptime(owner.get("since", ""), "%%Y-%%m-%%d %%H:%%M:%%S"))
+    except Exception:
+        try:
+            age = time.time() - os.stat(f if owner else lock).st_mtime
+        except OSError:
+            age = None
+    if owner is None:
+        if age is not None and age <= 30:
+            out["holder"] = {"who": "a run starting", "age_s": age}
+    elif owner.get("host") != os.uname().nodename or (pid > 0 and alive(pid)):
+        owner["age_s"] = age
+        out["holder"] = owner
+try:
+    names = os.listdir(os.path.join(d, "%(queue)s"))
+except OSError:
+    names = []
+for name in names:
+    pid = name.rsplit("-", 1)[-1]
+    if not (pid.isdigit() and not alive(int(pid))):
+        out["waiting"] += 1
+try:
+    out["stopped"] = [json.loads(x) for x in open(os.path.join(d, "%(stopped)s")).read().splitlines() if x.strip()]
+except (OSError, ValueError):
+    pass
+tool = sys.argv[2] if len(sys.argv) > 2 else ""
+if tool and not out["holder"] and not out["waiting"]:
+    try:
+        p = subprocess.run(["zsh", "-l", "-c", tool + " --version"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True, timeout=20)
+        bad, err = p.returncode != 0, p.stderr
+    except Exception as e:
+        bad, err = True, str(e)
+    if bad:
+        lines = [x.strip() for x in (err or "").splitlines() if x.strip()]
+        out["not_ready"] = lines[0] if lines else tool + " --version failed"
+print(json.dumps(out))
+""" % {"lock": EXCLUSIVE_LOCK, "queue": EXCLUSIVE_QUEUE, "stopped": EXCLUSIVE_STOPPED}
+
+
+def remote_lock_state(host, repo, tool=None, errors=None):
+    """The other machine's lock as REMOTE_PROBE reads it there, with `free` added; None when it can't be read (then
+    `errors`, when given, gets the first error line). With `tool`, a machine that can't run it isn't free."""
+    first = ""
+    try:
+        cmd = f"python3 - {shlex.quote(repo)}" + (f" {shlex.quote(tool)}" if tool else "")
+        p = subprocess.run(ssh_args(host) + [cmd], input=REMOTE_PROBE, capture_output=True, text=True, timeout=60)
+        first = next((x.strip() for x in (p.stderr or "").splitlines() if x.strip()), "")
+        state = json.loads(p.stdout.strip().splitlines()[-1]) if p.returncode == 0 and p.stdout.strip() else None
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        state, first = None, first or str(e)
+    if not isinstance(state, dict):
+        if errors is not None:
+            errors.append(first or f"ssh {host} answered nothing")
+        return None
+    state["free"] = not state.get("holder") and not state.get("waiting") and not state.get("not_ready")
+    return state
+
+
+def remote_lock_free(host, repo, tool=None, warn=None):
+    """True when the other machine's clone has no live heavy run holding or waiting for its lock, and, with `tool`,
+    when that machine can run it. `warn` gets the probe's first error line when it can't."""
+    state = remote_lock_state(host, repo, tool)
+    if state and state.get("not_ready") and warn is not None:
+        warn(state["not_ready"])
+    return bool(state and state["free"])
+
+
+def remote_watch(host, repo, cfg, lock, say, tool=None):
+    """The `remote_free` check a waiting run makes: free or not, and on the way it says (once) when the other
+    machine's lock has been held far longer than any check takes, and posts once each notice that machine left:
+    a long hold, or a run its ceiling stopped (#1796). It also says once when that machine can't run `tool`
+    (kit #20) or its lock can't be read at all, since the run then stays here."""
+    told = set()
+
+    def once(key, text):
+        if key not in told:
+            told.add(key)
+            say(text)
+
+    def check():
+        errors = []
+        state = remote_lock_state(host, repo, tool, errors)
+        if not state:
+            once("unreadable", f"{WARN} Couldn't read {host}'s lock ({errors[0][:200]}); staying here.")
+            return False
+        if state.get("not_ready"):
+            once("not_ready", f"{WARN} {host} can't run {tool} ({state['not_ready'][:200]}); staying here.")
+        holder = state.get("holder") or {}
+        if holder.get("pid") and held_long(holder.get("age_s")):
+            key = f"held|{host}|{holder.get('pid')}|{holder.get('since')}"
+            if key not in told:
+                told.add(key)
+                say(f"{WARN} {host}'s lock has been held since {holder.get('since', '?')} "
+                    f"({say_age(holder['age_s'])}) by {holder.get('who', '?')}, far longer than any check takes: "
+                    "no run here goes there until it ends.")
+                post_notice(cfg, lock, key, holder.get("who"), long_hold_body(holder, host, holder["age_s"]), say)
+        notice_stopped(cfg, lock, state.get("stopped") or [], say)
+        return state["free"]
+    return check
+
+
+def notice_stopped(cfg, lock, records, say):
+    for rec in records:
+        post_notice(cfg, lock, f"stopped|{rec.get('host')}|{rec.get('pid')}|{rec.get('since')}", rec.get("who"),
+                    stopped_body(rec), say)
+
+
+def heavy_lock_report(root):
+    """[(level, text, detail)] for doctor: this machine's heavy-run lock, and the other machine's when one is set."""
+    out, lock = [], exclusive_lock_path(root)
+    owner = None
+    if lock.is_dir():
+        try:
+            owner = json.loads((lock / "owner").read_text())
+        except (OSError, ValueError):
+            owner = {}
+    if owner is None:
+        out.append(("ok", "Heavy-run lock here: free", ""))
+    elif owner.get("host") == os.uname().nodename and not pid_alive(int(owner.get("pid") or 0)):
+        out.append(("info", "Heavy-run lock here: left by a run that ended", "the next exclusive takes it over"))
+    else:
+        age = lock_age_seconds(owner, lock / "owner")
+        long_ = held_long(age)
+        out.append(("warn" if long_ else "info",
+                    f"Heavy-run lock here: held by {owner.get('who', '?')} since {owner.get('since', '?')}"
+                    + (f" ({say_age(age)}), far longer than any check takes" if long_ else ""),
+                    f"pid {owner.get('pid', '?')}" + ("; compare its CPU time with its elapsed time "
+                                                      "(ps -o pid,etime,time,command -p <pid>)" if long_ else "")))
+    if lock.with_name(EXCLUSIVE_LOG).exists():
+        week = run_log_summary(read_run_log(lock), 7)["total"]
+        out.append(("info", f"Heavy runs here, last 7 days: {week['runs']}, median wait "
+                    f"{say_seconds(week['wait_median_s'])}, longest {say_seconds(week['wait_max_s'])}",
+                    "per day: python3 tools/haam/haam.py exclusive --report"))
+    host = os.environ.get(REMOTE_RUNNER_ENV, "").strip()
+    if host:
+        repo = os.environ.get(REMOTE_REPO_ENV, "").strip() or remote_repo_default(root)
+        state = remote_lock_state(host, repo)
+        holder = (state or {}).get("holder") or {}
+        if state is None:
+            out.append(("warn", f"{host}'s heavy-run lock: couldn't be read", f"ssh {host}, repo {repo}"))
+        elif holder and held_long(holder.get("age_s")):
+            out.append(("warn", f"{host}'s heavy-run lock: held by {holder.get('who', '?')} since "
+                        f"{holder.get('since', '?')} ({say_age(holder['age_s'])}), far longer than any check takes",
+                        f"pid {holder.get('pid', '?')} there; no run goes there until it ends"))
+        elif holder or state.get("waiting"):
+            out.append(("info", f"{host}'s heavy-run lock: busy", f"held by {holder.get('who', 'nobody')}, "
+                        f"{state.get('waiting', 0)} waiting"))
+        else:
+            out.append(("ok", f"{host}'s heavy-run lock: free", "make runs go there when this machine is busy"))
+    return out
+
+
+def snapshot_commit(root):
+    """The commit to run elsewhere: HEAD when the tree is clean, else a commit of the tree as it is now (staged,
+    unstaged and untracked files, .gitignore respected). No branch, index or stash is touched."""
+    head = git_out(root, "rev-parse", "HEAD")
+    if not head:
+        return None
+    if not git_out(root, "status", "--porcelain"):
+        return head
+    fd, index = tempfile.mkstemp(prefix="haam-remote-index-")
+    os.close(fd)
+    env = dict(os.environ, GIT_INDEX_FILE=index)
+    try:
+        for step in (["git", "read-tree", "HEAD"], ["git", "add", "-A"]):
+            if subprocess.run(step, cwd=root, env=env, capture_output=True).returncode != 0:
+                return None
+        tree = subprocess.run(["git", "write-tree"], cwd=root, env=env, capture_output=True, text=True).stdout.strip()
+        if not tree:
+            return None
+        c = subprocess.run(["git", "commit-tree", tree, "-p", head, "-m", "haam exclusive: snapshot for a remote run"],
+                           cwd=root, capture_output=True, text=True)
+        return c.stdout.strip() or None
+    finally:
+        try:
+            os.unlink(index)
+        except OSError:
+            pass
+
+
+REMOTE_SETUP_FAILED = 97
+
+
+def running_note(who, command):
+    """What `exclusive` says as its command starts. A remote run's is how this machine knows the command started
+    there (#924)."""
+    return f"{who}: running {' '.join(command)}"
+
+
+def run_remote(host, repo, command, who, root, say, timeout_min=60.0, quiet_s=10.0, max_run=None, log=None):
+    """Run `command` on `host` in a temporary worktree of the same commit, through that host's own `exclusive`,
+    which waits as long as this run was told to (`timeout_min`, `quiet_s`) and stops the command after `max_run`
+    minutes (REMOTE_MAX_RUN_MINUTES when not given: a run there must never hold that machine for days, #1796).
+    Returns the command's exit code, or None when the command never started there (the caller waits here instead).
+    `log`, a run's log record, gets `started` when the command starts there.
+
+    ⛔ A COMMAND THAT STARTED THERE IS NEVER RUN AGAIN HERE (#924). ssh's 255 means "the connection failed", before the
+    run or in the middle of it: on 2 Nov 2026 the connection timed out 40 minutes into `make check`, and the whole
+    run started again on the laptop. So the output is read as it streams back, and once the other machine's
+    `exclusive` says its command is running, its exit code is the answer, a dropped connection included."""
+    sha = snapshot_commit(root)
+    if not sha:
+        say(f"{WARN} Couldn't make a commit of this tree to send to {host}; staying here.")
+        return None
+    run_id = f"{socket.gethostname().split('.')[0]}-{os.getpid()}-{int(time.time())}"
+    ref = f"refs/haam-remote/{run_id}"
+    # The clone's own core.sshCommand may pin a GitHub key the other machine doesn't accept: use plain ssh there.
+    ssh_cmd = " ".join(shlex.quote(a) for a in ssh_args(host)[:-1])
+    # This machine's main goes too (#1869): the other clone's origin/main is its own and may be days older, so a
+    # check that diffs the branch against main (check-changed) saw every file merged since and ran everything.
+    # The run gets it as HAAM_BASE_COMMIT, and the commit itself rides along under <ref>-base.
+    default = load_config(root).get("default_branch") or "main"
+    base = git_out(root, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{default}^{{commit}}")
+    refspecs = [f"{sha}:{ref}"] + ([f"{base}:{ref}-base"] if base else [])
+    push = subprocess.run(["git", "-c", f"core.sshCommand={ssh_cmd}", "push", "--quiet", f"{host}:{repo}", *refspecs],
+                          cwd=root, capture_output=True, text=True)
+    if push.returncode != 0:
+        say(f"{WARN} Couldn't send commit {sha[:9]} to {host} ({(push.stderr or push.stdout).strip()[:200]}); staying here.")
+        return None
+    remote_cmd = " ".join(shlex.quote(c) for c in command)
+    there_who = f"{who} (from {socket.gethostname().split('.')[0]})"
+    remote_who = shlex.quote(there_who)
+    script = f"""set -u
+repo={shlex.quote(repo)}
+case "$repo" in /*) ;; *) repo="$HOME/$repo" ;; esac
+ref={shlex.quote(ref)}
+wt="$(dirname "$repo")/connect-wt/haam-remote-{run_id}"
+mkdir -p "$(dirname "$wt")"
+cleanup() {{ cd "$HOME"; git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1; git -C "$repo" update-ref -d "$ref" >/dev/null 2>&1; git -C "$repo" update-ref -d "$ref-base" >/dev/null 2>&1; }}
+trap cleanup EXIT
+git -C "$repo" worktree add --quiet --detach "$wt" "$ref" < /dev/null || exit {REMOTE_SETUP_FAILED}
+cd "$wt" || exit {REMOTE_SETUP_FAILED}
+{f"export HAAM_BASE_COMMIT={base}" if base else "unset HAAM_BASE_COMMIT"}
+echo "▶ $(hostname -s): {sha[:9]} in a temporary worktree"
+python3 tools/haam/haam.py worktree prep < /dev/null > /dev/null 2>&1
+if [ -f Makefile ] && grep -qE '^setup:' Makefile; then
+  # The log goes in the worktree's own git folder, never its tree: an untracked file there is a change to every
+  # check that reads the tree (#1869: check-changed planned everything for it).
+  setup_log="$(git rev-parse --git-dir)/haam-remote-setup.log"
+  make setup < /dev/null > "$setup_log" 2>&1 || {{ tail -20 "$setup_log"; exit {REMOTE_SETUP_FAILED}; }}
+fi
+{NOTICE_ENV}=off python3 tools/haam/haam.py exclusive --timeout {timeout_min:g} --quiet {quiet_s:g} --max-run {max_run or REMOTE_MAX_RUN_MINUTES:g} {remote_who} -- {remote_cmd} < /dev/null 2>&1
+"""
+    say(f"{INFO} {host} is free: running {remote_cmd} there on {sha[:9]}.")
+    started, seen, note = False, b"", running_note(there_who, command).encode()
+    try:
+        p = subprocess.Popen(ssh_args(host) + ["zsh -l -s"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    except OSError as e:
+        say(f"{WARN} ssh to {host} failed ({e}); staying here.")
+        return None
+    try:
+        try:
+            p.stdin.write(script.encode())
+            p.stdin.close()
+        except OSError:
+            pass                # ssh ended before reading the script: its exit code says why
+        out = sys.stdout.buffer
+        while True:
+            chunk = os.read(p.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            out.write(chunk)
+            out.flush()
+            if not started:
+                seen = seen[-len(note):] + chunk
+                started = note in seen
+                if started and log is not None:
+                    log["started"] = now_stamp()
+        code = p.wait()
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+    if started and code == 255:
+        say(f"{BAD} The connection to {host} dropped during the run (exit 255). It is not run again here: "
+            "its result is unknown, so run it again.")
+        return code
+    if not started and code in (REMOTE_SETUP_FAILED, 124, 255):
+        say(f"{WARN} The run didn't start on {host} (exit {code}); staying here.")
+        return None
+    say(f"{INFO} {who}: finished on {host} with exit {code}.")
+    return code
+
+
+def run_with_ceiling(command, max_run, say, who):
+    """Run `command` and wait for it; past `max_run` minutes (None: no limit), end it and everything it started.
+    Returns (exit code, None) or (RUN_CEILING_EXIT, a record of the stop). Interrupted (Ctrl-C, a signal), it ends
+    the command before passing the interruption on, so the lock is never released under a run still going."""
+    since, started = time.strftime("%Y-%m-%d %H:%M:%S"), time.time()
+    say(f"{INFO} {running_note(who, command)}")
+    child = subprocess.Popen(command)
+    try:
+        return child.wait(timeout=max_run * 60 if max_run else None), None
+    except subprocess.TimeoutExpired:
+        stop_tree(child)
+        return RUN_CEILING_EXIT, {"who": who, "pid": os.getpid(), "since": since, "command": " ".join(command),
+                                  "host": os.uname().nodename if hasattr(os, "uname") else "",
+                                  "minutes": round((time.time() - started) / 60)}
+    except BaseException:
+        if child.poll() is None:
+            stop_tree(child)
+        raise
+
+
+def cmd_exclusive(args):
+    """Run a heavy command (one that uses a machine-wide resource) when no other one is running on this machine."""
+    if getattr(args, "report", False):
+        lock = exclusive_lock_path(find_repo_root(Path.cwd()))
+        summary = run_log_summary(read_run_log(lock), args.days)
+        if args.json:
+            print(json.dumps(summary, indent=2))
+        else:
+            print_run_report(summary, str(lock.with_name(EXCLUSIVE_LOG)))
+        return
+    if not args.who:
+        sys.exit('Say who is asking, then the command after --, e.g. haam.py exclusive "chat A, #12" -- make check '
+                 '(or --report for how long runs waited)')
+    command = list(args.command or [])
+    if "--" in command:     # options given after <who> land here too: read them, then the command after --
+        k = command.index("--")
+        pre = argparse.ArgumentParser(prog="haam.py exclusive", add_help=False)
+        pre.add_argument("--timeout", type=float)
+        pre.add_argument("--quiet", type=float)
+        pre.add_argument("--max-run", type=float)
+        opts, extra = pre.parse_known_args(command[:k])
+        if extra:
+            sys.exit(f"Unknown option(s) before --: {' '.join(extra)}")
+        args.timeout = opts.timeout if opts.timeout is not None else args.timeout
+        args.quiet = opts.quiet if opts.quiet is not None else args.quiet
+        args.max_run = opts.max_run if opts.max_run is not None else args.max_run
+        command = command[k + 1:]
+    if not command:
+        sys.exit('Give the command after --, e.g. haam.py exclusive "chat A, #12" -- make check')
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    patterns = cfg.get("heavy_runs") or []
+    say = lambda m: print(m, file=sys.stderr, flush=True)  # noqa: E731
+    lock = exclusive_lock_path(root)
+    host = os.environ.get(REMOTE_RUNNER_ENV, "").strip()
+    remote_free = None
+    if host and remote_eligible(command):
+        repo = os.environ.get(REMOTE_REPO_ENV, "").strip() or remote_repo_default(root)
+        remote_free = remote_watch(host, repo, cfg, lock, say, tool=Path(command[0]).name)
+
+    # This run's line in the log (log_run), written whatever the outcome. `machine` is where the command ran.
+    branch = git_out(root, "rev-parse", "--abbrev-ref", "HEAD")
+    rec = {"who": args.who, "command": " ".join(command)[:500], "branch": None if branch in ("", "HEAD") else branch,
+           "head": git_out(root, "rev-parse", "--short", "HEAD") or None, "asked": now_stamp(), "started": None,
+           "ended": None, "exit": None, "machine": short_host(), "remote": False, "fell_back": False,
+           "stopped": False, "nested": False}
+
+    def long_hold(owner, age):
+        post_notice(cfg, lock, f"held|{owner.get('host')}|{owner.get('pid')}|{owner.get('since')}", owner.get("who"),
+                    long_hold_body(owner, "this machine", age), say)
+
+    def here(place=None):
+        """Wait for this machine and run the command here. The lock is free again before a stop is reported, so a
+        report that can't be written (the connection that started this run is gone) never holds the machine."""
+        nonlocal turn
+        turn = MachineTurn(args.who, patterns, args.timeout, args.quiet, say=say, remote_free=remote_free,
+                           place=place, on_long_hold=long_hold)
+        with turn:
+            rec["nested"], rec["started"] = turn.nested, now_stamp()
+            code, stopped = run_with_ceiling(command, args.max_run, say, args.who)
+        rec["stopped"] = bool(stopped)
+        if stopped:
+            record_stopped(lock, stopped)
+            say(f"{BAD} {args.who}: stopped after {stopped['minutes']} min, its ceiling (--max-run {args.max_run:g}): "
+                f"the run made no end, and the lock is free again. Its result is unknown (exit {RUN_CEILING_EXIT}).")
+            notice_stopped(cfg, lock, [stopped], say)
+        return code
+
+    turn = None
+    final = 1       # the exit code this process ends with, for the log
+    try:
+        try:
+            try:
+                sys.exit(here())
+            except RemoteTurn as away:
+                remote_free = None
+                rec["remote"], rec["machine"] = True, host
+                code = run_remote(host, repo, command, args.who, root, say, args.timeout, args.quiet, args.max_run,
+                                  log=rec)
+                if code == RUN_CEILING_EXIT:
+                    rec["stopped"] = True
+                    state = remote_lock_state(host, repo)
+                    notice_stopped(cfg, lock, (state or {}).get("stopped") or [], say)
+                if code is not None:
+                    sys.exit(code)
+                rec.update(remote=False, fell_back=True, machine=short_host(), started=None)
+                sys.exit(here(away.place))
+        except TimeoutError:
+            waiting = f", waiting for {'; '.join(turn.blocking)}" if turn is not None and turn.blocking else ""
+            print(f"✘ Gave up after {args.timeout:g} minutes: the machine was still busy{waiting}. Nothing was run.",
+                  file=sys.stderr)
+            sys.exit(124)
+        except FileNotFoundError:
+            sys.exit(f"Command not found: {command[0]}")
+    except SystemExit as e:
+        final = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        raise
+    except KeyboardInterrupt:
+        final = 130
+        raise
+    finally:
+        rec["exit"], rec["ended"] = final, now_stamp()
+        log_run(lock, rec)
+
+
+def paths_in_use():
+    """Folders that running programs have as their working directory (to keep a chat's worktree while it runs)."""
+    out = set()
+    proc = Path("/proc")
+    if proc.is_dir() and (proc / "self" / "cwd").exists():
+        for d in proc.iterdir():
+            if d.name.isdigit() and d.name != str(os.getpid()):
+                try:
+                    out.add(os.path.realpath(os.readlink(d / "cwd")))
+                except OSError:
+                    pass
+        return out
+    if have("lsof"):
+        try:
+            p = subprocess.run(["lsof", "-a", "-d", "cwd", "-F", "pn"], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return out
+        pid = None
+        for line in p.stdout.splitlines():
+            if line.startswith("p"):
+                pid = line[1:]
+            elif line.startswith("n") and pid != str(os.getpid()):
+                out.add(os.path.realpath(line[1:]))
+    return out
+
+
+# ----------------------------------------------------------------------------- invite
+
+def cmd_invite(args):
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    rep = Report()
+    rep.section(f"Invite {args.github}")
+    if gh_ready(rep, cfg):
+        repo = cfg["github_repo"]
+        code, _, _ = run(["gh", "api", f"repos/{repo}/collaborators/{args.github}"])
+        if code == 0:
+            rep.add("ok", f"{args.github} already has access to {repo}")
+        elif args.apply:
+            c2, _, e2 = run(["gh", "api", "-X", "PUT", f"repos/{repo}/collaborators/{args.github}",
+                             "-f", "permission=push"])
+            rep.add("ok" if c2 == 0 else "fail",
+                    f"GitHub invitation sent (write access, not admin)" if c2 == 0 else "GitHub invite failed", e2[:200])
+        else:
+            rep.add("warn", f"{args.github} has no access", "will invite with write (not admin) access")
+
+    if cfg.get("tracker") == "github" and cfg.get("github_project_number") and have("gh"):
+        try:
+            board = GHProject(cfg)
+            proj = board.load()
+            if args.apply:
+                code, uid, err = run(["gh", "api", f"users/{args.github}", "--jq", ".node_id"])
+                if code != 0 or not uid:
+                    raise RuntimeError(f"GitHub user {args.github} not found")
+                gql("mutation($p:ID!,$u:ID!){ updateProjectV2Collaborators(input:{projectId:$p,"
+                    " collaborators:[{userId:$u, role:WRITER}]}){ collaborators(first:1){ totalCount } } }",
+                    {"p": proj["id"], "u": uid})
+                rep.add("ok", f"{args.github} can edit the board", proj["url"])
+            else:
+                rep.add("warn", f"Board #{proj['number']}: will give {args.github} write access")
+        except RuntimeError as e:
+            rep.add("warn", "Board access not granted automatically", str(e)[:160])
+            rep.action(WHO_BROWSER, f"Share the board with {args.github} (board → ⋯ → Settings → Manage access)")
+
+    if args.linear_email and cfg.get("tracker") == "github":
+        rep.add("info", "Tracker is GitHub Projects: no Linear invite needed")
+    elif args.linear_email:
+        key = linear_key(rep)
+        if key:
+            lin = Linear(key)
+            try:
+                team = lin.q('query($k:String!){ teams(filter:{key:{eq:$k}}) { nodes { id } } }',
+                             {"k": cfg["team_key"]})["teams"]["nodes"]
+                if not lin.has_mutation("organizationInviteCreate"):
+                    raise RuntimeError("invite API not available")
+                fields = lin.input_fields("OrganizationInviteCreateInput")
+                inp = {"email": args.linear_email}
+                if "teamIds" in fields and team:
+                    inp["teamIds"] = [team[0]["id"]]
+                if args.apply:
+                    lin.q('mutation($i:OrganizationInviteCreateInput!){ organizationInviteCreate(input:$i){ success } }',
+                          {"i": inp})
+                    rep.add("ok", f"Linear invitation sent to {args.linear_email}",
+                            "added to the team" if "teamIds" in inp else "add them to the team after they accept")
+                else:
+                    rep.add("warn", f"Linear: will invite {args.linear_email}")
+            except RuntimeError as e:
+                rep.add("warn", "Linear invite not sent automatically", str(e)[:160])
+                rep.action(WHO_BROWSER, f"Invite {args.linear_email} in Linear → Settings → Members, "
+                           f"then add them to team {cfg['team_key']}")
+
+    rep.section("Send the new developer")
+    rep.add("info", "Repository link and docs/ONBOARDING.md")
+    rep.add("info", "Test credentials for local .env, via a password manager or one-time link (never chat/email)")
+    rep.add("info", "Their first message to their agent: \"Run /haam-onboard\" (Codex: $haam-onboard)")
+    if not args.apply:
+        rep.add("info", "Plan only. Re-run with --apply to send invitations")
+    rep.print(args.json)
+
+
+# ----------------------------------------------------------------------------- dev
+
+HOOK_MARK = "HAAM secret hook"
+CHAINED_HOOK = f"""#!/usr/bin/env bash
+# {HOOK_MARK}: runs the shared secret scan (.githooks/pre-commit) when this branch has it.
+# Installed by `haam.py hooks --apply` instead of core.hooksPath, so this repository's other hooks keep working.
+top=$(git rev-parse --show-toplevel)
+if [ -f "$top/.githooks/pre-commit" ]; then bash "$top/.githooks/pre-commit" || exit $?; fi
+"""
+CHAIN_LINE = ('t=$(git rev-parse --show-toplevel); '
+              'if [ -f "$t/.githooks/pre-commit" ]; then bash "$t/.githooks/pre-commit" || exit $?; fi')
+
+
+def git_hooks_dir(root):
+    common = git_out(root, "rev-parse", "--git-common-dir") or ".git"
+    return (Path(root) / common).resolve() / "hooks"
+
+
+def own_git_hooks(root):
+    """This repository's own hooks in .git/hooks (not git's samples, not ours). core.hooksPath would switch them off."""
+    d = git_hooks_dir(root)
+    if not d.is_dir():
+        return []
+    return sorted(f.name for f in d.iterdir() if f.is_file() and not f.name.endswith(".sample")
+                  and HOOK_MARK not in f.read_text(errors="ignore"))
+
+
+def secret_hook_on(root):
+    """Whether a commit here runs the secret scan: via core.hooksPath (.githooks, or another hook manager's folder
+    whose pre-commit calls it) or via the pre-commit in .git/hooks."""
+    hp = git_out(root, "config", "core.hooksPath")
+    if hp == ".githooks":
+        return os.access(Path(root) / ".githooks/pre-commit", os.X_OK)
+    pc = (Path(root) / hp / "pre-commit") if hp else (git_hooks_dir(root) / "pre-commit")
+    return pc.is_file() and os.access(pc, os.X_OK) and ".githooks/pre-commit" in pc.read_text(errors="ignore")
+
+
+def setup_secret_hook(root, apply, rep):
+    """Turn on the commit secret scan without switching off the repository's own git hooks: core.hooksPath when
+    .git/hooks holds nothing of its own, otherwise a small pre-commit in .git/hooks that calls .githooks/pre-commit."""
+    if apply:      # git ignores hooks that aren't executable, whichever way they're switched on
+        for f in list((root / ".githooks").glob("*")) + list((root / "scripts").glob("*.sh")) + \
+                list((root / ".claude/hooks").glob("*.sh")):
+            f.chmod(f.stat().st_mode | 0o111)
+    hp = git_out(root, "config", "core.hooksPath")
+    mine = own_git_hooks(root)
+    if hp and hp != ".githooks":
+        on = secret_hook_on(root)
+        rep.add("ok" if on else "warn", f"Git hooks are managed elsewhere (core.hooksPath = {hp})",
+                "the secret scan runs from there" if on else
+                f"add this line to {hp}/pre-commit so the secret scan runs: {CHAIN_LINE}")
+        return
+    pc = git_hooks_dir(root) / "pre-commit"
+    own_pc = pc.is_file() and HOOK_MARK not in pc.read_text(errors="ignore")
+    if own_pc and ".githooks/pre-commit" not in pc.read_text(errors="ignore"):
+        # Their own pre-commit: never edited. Leave core.hooksPath as it is, so a scan that's on stays on.
+        if hp == ".githooks":
+            rep.add("warn", "core.hooksPath = .githooks is switching off this repository's own hooks: " + ", ".join(mine),
+                    f"to keep the secret scan and run your hooks again, add this line to .git/hooks/pre-commit: "
+                    f"{CHAIN_LINE}, then run: git config --unset core.hooksPath")
+        else:
+            rep.add("warn", "You have your own .git/hooks/pre-commit, so the secret scan isn't on",
+                    f"add this line to it (it's yours, so the kit doesn't edit it): {CHAIN_LINE}")
+        return
+    if hp == ".githooks" and not mine:
+        rep.add("ok" if secret_hook_on(root) else "warn", "Secret-scan commit hook on")
+        return
+    if own_pc:      # their pre-commit already calls the scan
+        if hp == ".githooks":
+            rep.add("warn", "core.hooksPath = .githooks is switching off this repository's own hooks: " + ", ".join(mine),
+                    "will unset it: your pre-commit already runs the scan" if not apply else "")
+            if apply:
+                run(["git", "config", "--unset", "core.hooksPath"], cwd=root)
+        rep.add("ok", "Secret-scan commit hook on (called from your own pre-commit)")
+        return
+    if not apply:
+        if hp == ".githooks":
+            rep.add("warn", "core.hooksPath = .githooks is switching off this repository's own hooks: " + ", ".join(mine),
+                    "will chain the secret scan instead, so they run again")
+        elif not secret_hook_on(root):
+            rep.add("warn", "Secret-scan commit hook off",
+                    "will turn on" + (" (chained: your own hooks keep working)" if mine else " (git config core.hooksPath .githooks)"))
+        else:
+            rep.add("ok", "Secret-scan commit hook on")
+        return
+    if mine or hp == ".githooks" or pc.is_file():
+        pc.parent.mkdir(parents=True, exist_ok=True)
+        pc.write_text(CHAINED_HOOK)
+        pc.chmod(0o755)
+        if hp == ".githooks":
+            run(["git", "config", "--unset", "core.hooksPath"], cwd=root)
+        rep.add("ok", "Secret-scan commit hook turned on", "chained from .git/hooks/pre-commit; your own hooks keep working")
+    else:
+        c2, _, e2 = run(["git", "config", "core.hooksPath", ".githooks"], cwd=root)
+        rep.add("ok" if c2 == 0 else "fail", "Secret-scan commit hook turned on" if c2 == 0 else "Couldn't set the hook", e2[:160])
+
+
+def glob_regex(pattern):
+    """A path pattern as a regex: ** any folders, * within one folder, ? one character (same rules as gates.yml).
+    A leading ./ or / is ignored; a trailing / means everything inside; a plain name (no * or ?) is that file or
+    everything inside that folder."""
+    pattern = re.sub(r"^(\./|/)+", "", pattern.strip())
+    if pattern.endswith("/"):
+        pattern += "**"
+    if not re.search(r"[*?]", pattern):
+        return re.compile("^" + re.escape(pattern) + "(?:/.*)?$")
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out += "(?:.*/)?"
+            i += 3
+        elif pattern.startswith("**", i):
+            out += ".*"
+            i += 2
+        elif pattern[i] == "*":
+            out += "[^/]*"
+            i += 1
+        elif pattern[i] == "?":
+            out += "[^/]"
+            i += 1
+        else:
+            out += re.escape(pattern[i])
+            i += 1
+    return re.compile("^" + out + "$")
+
+
+def protected_matches(patterns, files):
+    regs = [glob_regex(p) for p in patterns or []]
+    return [f for f in files if any(r.match(f) for r in regs)]
+
+
+def cmd_protected(args):
+    """Which changed files are in a protected area (haam.config.json "protected_paths"), compared with the base."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    base = args.base or default_base(root)
+    code, out, err = run(["git", "diff", "--name-only", "--no-renames", f"{base}...HEAD"], cwd=root)
+    if code != 0 or base == "HEAD":
+        sys.exit(f"Couldn't compare with {base} ({(err or 'no base branch').strip()[:160]}). Fetch first, or pass --base.")
+    files = out.splitlines()     # --no-renames: a file moved out of a protected folder counts by its old path too
+    hits = protected_matches(cfg.get("protected_paths"), files)
+    if args.json:
+        print(json.dumps({"base": base, "protected": hits}, indent=2))
+    elif hits:
+        print(f"{WARN} Protected areas changed (add the PR label human-review; no uat:skip lane): " + ", ".join(hits))
+    else:
+        print(f"{OK} No protected areas changed (compared with {base})")
+    sys.exit(1 if hits and args.check else 0)
+
+
+def cmd_overlap(args):
+    """Which branches waiting for the owner's test change the same files as some new work, so /next can pick work that
+    won't collide with them (or batch it with them). Overlapping branches waiting together end in merge conflicts after
+    the first one merges, and the conflicted one needs a fresh test."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    run(["git", "fetch", "--quiet", "--prune", "origin"], cwd=root)
+    base = default_base(root)
+    waiting = []
+    if args.branch:
+        waiting = [{"issue": None, "branch": b} for b in args.branch]
+    elif cfg.get("tracker") == "github":
+        try:
+            board = GHProject(cfg)
+            board.load()
+            items = [i for i in board.items() if i["status"] == "UAT" and i["state"] == "OPEN"]
+        except RuntimeError as e:
+            sys.exit(f"Couldn't read the board: {e}")
+        seen = set()
+        for i in items:
+            try:
+                branch = find_branch(root, cfg, issue_ref(cfg, str(i["number"])))[0]
+            except RuntimeError:
+                branch = None
+            if branch and branch not in seen:      # a batch's issues share one branch
+                seen.add(branch)
+                waiting.append({"issue": f"#{i['number']}", "title": i.get("title", ""), "branch": branch})
+    else:
+        sys.exit("Linear: give the branches of the issues in UAT with --branch (repeatable), from their UAT comments.")
+    want = [x.strip() for x in (args.files or "").split(",") if x.strip()]
+    for w in waiting:
+        ref = w["branch"] if not git_out(root, "rev-parse", "--verify", "--quiet", f"origin/{w['branch']}") \
+            else f"origin/{w['branch']}"
+        code, out, _ = run(["git", "diff", "--name-only", "--no-renames", f"{base}...{ref}"], cwd=root)
+        w["files"] = out.splitlines() if code == 0 else []
+        w["overlap"] = protected_matches([x if any(c in x for c in "*?") or not x.endswith("/") else x + "**"
+                                          for x in want], w["files"]) if want else []
+    hits = [w for w in waiting if w["overlap"]]
+    res = {"base": base, "waiting": waiting, "files": want, "overlapping": [w["branch"] for w in hits]}
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return
+    if not waiting:
+        print(f"{OK} Nothing is waiting for the owner's test.")
+        return
+    if not want:
+        for w in waiting:
+            print(f"  {w.get('issue') or ''} {w['branch']}: {len(w['files'])} file(s)")
+            for f in w["files"][:20]:
+                print(f"      {f}")
+        return
+    if hits:
+        for w in hits:
+            print(f"{WARN} {w.get('issue') or w['branch']} ({w['branch']}) waits with the same files: "
+                  + ", ".join(w["overlap"][:8]) + (" …" if len(w["overlap"]) > 8 else ""))
+    else:
+        print(f"{OK} No overlap with the {len(waiting)} branch(es) waiting for the owner's test.")
+
+
+def production_files(cfg, files):
+    """The files that are production code: in production_paths and not in non_production_paths."""
+    prod = protected_matches(cfg.get("production_paths") or ["**"], files)
+    keep_out = set(protected_matches(cfg.get("non_production_paths") or [], prod))
+    return [f for f in prod if f not in keep_out]
+
+
+def cmd_production(args):
+    """Which changed files are production code (what runs for users), compared with the base."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    base = args.base or default_base(root)
+    code, out, err = run(["git", "diff", "--name-only", "--no-renames", f"{base}...HEAD"], cwd=root)
+    if code != 0 or base == "HEAD":
+        sys.exit(f"Couldn't compare with {base} ({(err or 'no base branch').strip()[:160]}). Fetch first, or pass --base.")
+    files = out.splitlines()
+    hits = production_files(cfg, files)
+    branch = git_out(root, "branch", "--show-current") or ""
+    res = {"base": base, "production": hits, "other": [f for f in files if f not in hits],
+           "spike": branch.startswith("spike/")}
+    if args.json:
+        print(json.dumps(res, indent=2))
+    elif hits:
+        print(f"{WARN} Production code changed ({len(hits)} file(s)): " + ", ".join(hits[:20])
+              + (" …" if len(hits) > 20 else ""))
+        if res["spike"]:
+            print("   On a spike branch that's fine, but it can't ship as it is: it goes through /spec and the gates.")
+    else:
+        print(f"{OK} No production code changed (compared with {base}): only " + (", ".join(files[:8]) or "nothing"))
+    sys.exit(1 if hits and args.check else 0)
+
+
+# ----------------------------------------------------------------------------- uat: agents-verify (the verify lane)
+# A change that needs no person to judge it, and touches none of the owner's own areas (owner_test_paths), is verified
+# by an independent agent at the handed-over commit instead of waiting in UAT. Its marks are its own (the commit status
+# `agent-verified`, the label `verified-by-agents`, a 🔎 comment), never the owner's (`uat`, `uat-passed`, `uat:skip`),
+# and it ships only on the owner's `ship`. `issue_lane`, `verification_state` and `verified_head_counts` are what
+# `ship` and the gate's helpers call.
+
+OWNER_TEST_LABEL = "owner-test"
+LANE_LABEL_NAMES = {"verifying", "verified-by-agents", "verify-failed", OWNER_TEST_LABEL, "spot-check"}
+LANE_KEYS = ("uat", "owner_test_paths", "agents_verify_shadow", "max_review_rounds")
+VERIFY_CLAIM_WHAT = " to verify it"
+READY_VERIFY_MARK, READY_UAT_MARK = "🧪 Ready for verification", "🧪 Ready for UAT"
+VERIFIED_MARK, NOT_VERIFIED_MARK, NEEDS_OWNER_MARK = "🔎 Verified by agents", "🔎 Not verified", "🔎 Needs your test"
+PULLED_BACK_MARK = "↩️ Pulled back"
+VERIFIED_CONTEXT = "agent-verified"
+VERIFY_DOCS_ONLY = ("docs/uat/", "docs/changes/")   # a tip that differs from the verified commit only here still counts
+SPOT_CHECK_EVERY = 10
+SPIKE_COMMIT = re.compile(r"^(?:\S+:\s*)?spike:", re.I)     # as the gate reads a kept prototype's commits
+PLAN_KEYS = (("needs_person", "Needs a person"), ("verified_at", "Verified at"), ("risk", "Risk"), ("undo", "Undo"))
+OTHER_PHASES = (" to assess it", " to write its spec", " to build a prototype", VERIFY_CLAIM_WHAT)
+
+
+def owner_test_areas(cfg):
+    """owner_test_paths as {area: [patterns]} (a list of "area=pattern" strings is read too)."""
+    raw = (cfg or {}).get("owner_test_paths") or {}
+    areas = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            pats = [v] if isinstance(v, str) else list(v or [])
+            pats = [str(x).strip() for x in pats if str(x).strip()]
+            if str(k).strip() and pats:
+                areas[str(k).strip()] = pats
+    elif isinstance(raw, list):
+        for item in raw:
+            name, _, pat = str(item).partition("=")
+            if name.strip() and pat.strip():
+                areas.setdefault(name.strip(), []).append(pat.strip())
+    return areas
+
+
+def set_owner_test_area(areas, value):
+    """One `--set owner_test_paths=…`: `<area>=<pattern>,<pattern>` sets that area, `<area>=` removes it, and an empty
+    value empties the list."""
+    value = value.strip()
+    if not value:
+        return {}
+    name, eq, pats = value.partition("=")
+    name = name.strip()
+    if not eq or not re.fullmatch(r"[\w][\w .:/+-]*", name):
+        sys.exit("owner_test_paths takes <area>=<pattern>,<pattern> (e.g. owner_test_paths=sign-in=src/auth/**), "
+                 "<area>= to remove an area, or nothing to empty the list")
+    out = dict(areas)
+    pats = [x.strip() for x in pats.split(",") if x.strip()]
+    if pats:
+        out[name] = pats
+    else:
+        out.pop(name, None)
+    return out
+
+
+def lane_config(root):
+    """The lane's settings as the default branch has them (origin first: what the gate reads), so a branch can't
+    change its own lane; the rest of the config as this folder has it."""
+    _, main, _ = git_paths(root)
+    try:
+        cfg = dict(load_config(root))
+    except SystemExit:
+        cfg = {}
+    base = cfg.get("default_branch") or "main"
+    for spec in (f"origin/{base}:{CONFIG_NAME}", f"{base}:{CONFIG_NAME}"):
+        raw = git_out(main, "show", spec)
+        if not raw:
+            continue
+        try:
+            on_main = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        for k in LANE_KEYS:
+            cfg[k] = on_main.get(k)
+        return cfg
+    return cfg
+
+
+def branch_files(root, base, head):
+    """The files a branch changes against the base, a renamed or copied file by both names (as the gate reads them)."""
+    code, out, err = run(["git", "diff", "--name-status", "-M", f"{base}...{head}"], cwd=root)
+    if code != 0:
+        raise RuntimeError(f"Couldn't compare {head[:12]} with {base}: {(err or '').strip()[:160]}")
+    files = []
+    for line in out.splitlines():
+        for f in line.split("\t")[1:]:
+            if f and f not in files:
+                files.append(f)
+    return files
+
+
+def find_plan(root, ref, branch, head):
+    """(path, text) of the issue's UAT plan at the branch's head (a batch's plan is named after the branch's issue)."""
+    listed = git_out(root, "ls-tree", "--name-only", head, "docs/uat/").splitlines()
+    for r in dict.fromkeys(x for x in (ref, branch_issue(branch, ref)) if x is not None):
+        for path in sorted(listed):
+            if path.rsplit("/", 1)[-1].startswith(f"{file_id(r)}-") and path.endswith(".md"):
+                return path, git_out(root, "show", f"{head}:{path}")
+    return None, ""
+
+
+def plan_lines(text):
+    """The Agent pre-check lines of a UAT plan: {needs_person, verified_at, risk, undo} (those it has)."""
+    text = text or ""
+    m = re.search(r"(?m)^#+ .*Agent pre-check.*$", text)
+    if m:
+        rest = text[m.end():]
+        nxt = re.search(r"(?m)^## ", rest)
+        text = rest[:nxt.start()] if nxt else rest
+    out = {}
+    for key, label in PLAN_KEYS:
+        found = re.search(rf"(?mi)^\s*(?:[-*]\s+)?\**\s*{re.escape(label)}\s*:\s*\**\s*(.*?)\s*(?:<!--.*)?$", text)
+        if found:
+            out[key] = found.group(1).strip()
+    return out
+
+
+def issue_labels(repo, number):
+    code, out, err = run(["gh", "issue", "view", str(number), "-R", repo, "--json", "labels"])
+    if code != 0:
+        raise RuntimeError(f"Couldn't read #{number}: {(err or out)[:160]}")
+    return [x.get("name") for x in (json.loads(out or "{}").get("labels") or [])]
+
+
+def lane_details(root, cfg, number, labels=None, branch=None, head=None, base=None):
+    """issue_lane with what it read: {lane, reason, branch, head, files, plan, plan_fields}."""
+    d = {"issue": number, "lane": "owner", "reason": "", "branch": branch, "head": head, "files": [], "plan": None,
+         "plan_fields": {}}
+
+    def owner(why):
+        d["reason"] = why
+        return d
+    uat = setting_value(cfg, "uat")
+    if uat != "agents-verify":
+        return owner(f"the setting uat is {uat}, not agents-verify: the owner tests it, as before")
+    if labels is None:
+        labels = issue_labels(cfg["github_repo"], number)
+    if OWNER_TEST_LABEL in labels:
+        return owner("label owner-test: the owner tests it themselves")
+    if "uat-failed" in labels:
+        return owner("label uat-failed: rework after the owner's failed test stays the owner's")
+    if not branch or not head:
+        found, target, _ = find_branch(root, cfg, number, branch)
+        if not found:
+            return owner(f"no branch found for #{number}")
+        d["branch"], branch = found, found
+        head = head or git_out(root, "rev-parse", "--verify", "--quiet", target)
+        d["head"] = head
+        if not head:
+            return owner(f"can't read the tip of {found}")
+    base = base or default_base(root)
+    d["files"] = files = branch_files(root, base, head)
+    for area, pats in owner_test_areas(cfg).items():
+        hits = protected_matches(pats, files)
+        if hits:
+            more = f" and {len(hits) - 1} more" if len(hits) > 1 else ""
+            return owner(f"changes {area} ({hits[0]}{more}), one of the owner's own areas (owner_test_paths)")
+    subjects = git_out(root, "log", "--format=%s", f"{base}..{head}").splitlines()
+    if any(SPIKE_COMMIT.match(s) for s in subjects):
+        return owner("built from a prototype (spike: commits)")
+    d["plan"], text = find_plan(root, number, branch, head)
+    d["plan_fields"] = fields = plan_lines(text)
+    need = fields.get("needs_person") or ""
+    if re.match(r"(?i)yes\b", need):
+        why = re.sub(r"(?i)^yes\b[\s:,-]*", "", need).strip()
+        return owner(f"needs a person: {why.strip('()') or 'the plan says so'}")
+    if not re.match(r"(?i)no\b", need):
+        return owner("the plan has no line `Needs a person: yes (<why>)` or `no`" if d["plan"] else
+                     "no UAT plan on the branch (docs/uat/), so no `Needs a person:` line")
+    d["lane"] = "agents"
+    d["reason"] = "needs no person, and changes none of the owner's own areas"
+    return d
+
+
+def issue_lane(root, cfg, number, labels=None, branch=None, head=None, base=None):
+    """Who checks this ticket: ("agents", why) or ("owner", the first reason that applies). cfg: lane_config(root).
+    Reads the branch's changed files against the base (default origin/main), so fetch first."""
+    d = lane_details(root, cfg, number, labels=labels, branch=branch, head=head, base=base)
+    return d["lane"], d["reason"]
+
+
+def verdict_records(comments):
+    """The verifier's 🔎 records, oldest first: {verdict, branch, head, claim, tool, at, reason}."""
+    out = []
+    for c in comments:
+        body = c.get("body") or ""
+        verdict = ("verified" if body.startswith(VERIFIED_MARK) else "not-verified" if body.startswith(NOT_VERIFIED_MARK)
+                   else "needs-owner" if body.startswith(NEEDS_OWNER_MARK) else None)
+        if not verdict:
+            continue
+        first = body.splitlines()[0]
+        get = lambda pat: (re.search(pat, first) or [None, ""])[1]
+        out.append({"verdict": verdict, "branch": get(r"branch `([^`]+)`"), "head": get(r"· head ([0-9a-f]{7,40})"),
+                    "claim": get(r"· claim ([0-9a-f]{6,})"), "tool": get(r"· claim [0-9a-f]{6,} · (.+)$").strip(),
+                    "at": c.get("createdAt"), "shadow": "\n\nShadow start: " in body,
+                    "reason": get(r"^🔎 Needs your test: (.*?) · branch") if verdict == "needs-owner" else ""})
+    return out
+
+
+def build_claim_tokens(comments):
+    """The ids of every build claim the issue ever had (claims to assess, spec, prototype or verify aren't builds)."""
+    return {claim_token(c.get("body")) for c in comments if (c.get("body") or "").startswith(CLAIM_MARK)
+            and not any(w in (c.get("body") or "") for w in OTHER_PHASES)} - {""}
+
+
+def verified_head_counts(root, verified_sha, tip_sha):
+    """Whether a verification of `verified_sha` still covers the branch at `tip_sha`: the same commit, or one that
+    differs from it only in files under docs/uat/ or docs/changes/ (the plan and the release note). Needs both commits
+    here (fetch first); False when it can't tell."""
+    if not verified_sha or not tip_sha:
+        return False
+    a, b = verified_sha.lower(), tip_sha.lower()
+    if len(a) >= 7 and len(b) >= 7 and (a.startswith(b) or b.startswith(a)):
+        return True
+    code, out, _ = run(["git", "diff", "--name-only", "--no-renames", a, b], cwd=root)
+    if code != 0:
+        return False
+    return all(f.startswith(VERIFY_DOCS_ONLY) for f in out.splitlines())
+
+
+def verification_state(root, cfg, number, labels, comments, head):
+    """Whether the ticket counts as verified by agents at the branch's `head` now: {verified, why, verified_at, claim,
+    tool, at}. Needs the verdict comment, the label, no owner-test, a head the verification still covers
+    (verified_head_counts) and the agent-verified status on the verified commit. shadow: verified during the shadow
+    start (agents_verify_shadow), so the owner still tests it and only their pass ships it."""
+    recs = verdict_records(comments)
+    rec = recs[-1] if recs else None
+    st = {"verified": False, "why": "", "verified_at": None, "claim": None, "tool": None, "at": None,
+          "shadow": False}
+    if rec and rec["verdict"] == "verified":
+        st.update(verified_at=rec["head"], claim=rec["claim"], tool=rec["tool"], at=rec["at"], shadow=rec["shadow"])
+    if OWNER_TEST_LABEL in labels:
+        st["why"] = "pulled back: the owner tests it (owner-test)"
+    elif not rec or rec["verdict"] != "verified":
+        st["why"] = ("sent back by the verifier (verify-failed)" if rec and rec["verdict"] == "not-verified"
+                     else "the verifier asked for the owner's test" if rec and rec["verdict"] == "needs-owner"
+                     else "waiting for a verifier" if "verifying" in labels else "not verified")
+    elif "verified-by-agents" not in labels:
+        st["why"] = "no label verified-by-agents"
+    elif not verified_head_counts(root, rec["head"], head):
+        st["why"] = (f"the branch moved on since the verified commit {rec['head'][:8]} (now {(head or '?')[:8]}): "
+                     "it needs verifying again")
+    elif not status_ok(cfg["github_repo"], rec["head"], VERIFIED_CONTEXT):
+        st["why"] = f"no {VERIFIED_CONTEXT} status on {rec['head'][:8]}"
+    else:
+        st["verified"] = True
+        st["why"] = f"verified by agents at {rec['head'][:8]} (claim {rec['claim']})"
+    return st
+
+
+def ensure_labels(repo, names):
+    for name, color, desc in GITHUB_LABELS:
+        if name in names:
+            run(["gh", "label", "create", name, "-R", repo, "--color", color, "--description", desc, "--force"])
+
+
+def edit_issue_labels(repo, number, add=(), remove=(), extra=()):
+    """Add and remove labels in one edit, creating the lane's labels if this repository doesn't have them yet."""
+    cmd = ["gh", "issue", "edit", str(number), "-R", repo] + list(extra)
+    for x in add:
+        cmd += ["--add-label", x]
+    for x in remove:
+        cmd += ["--remove-label", x]
+    if len(cmd) == 6:
+        return
+    code, out, err = run(cmd)
+    if code != 0 and "not found" in (err or out or "").lower():
+        ensure_labels(repo, set(add))
+        code, out, err = run(cmd)
+    if code != 0:
+        raise RuntimeError(err or out)
+
+
+def verify_claim_refusal(cfg, iss):
+    """Why `issue claim --for verify` can't take this issue (None: it can)."""
+    lcfg = lane_config(find_repo_root(Path.cwd()))
+    n, labels = iss["number"], iss["labels"] or []
+    if setting_value(lcfg, "uat") != "agents-verify":
+        return "Nothing is verified by agents here: the setting uat isn't agents-verify on main."
+    if OWNER_TEST_LABEL in labels:
+        return f"#{n} has owner-test: the owner tests it themselves."
+    if "spot-check" in labels and iss["status"] in ("In Review", "UAT"):
+        return None
+    if "verified-by-agents" in labels and "verifying" not in labels and iss["status"] == "In Review":
+        # A later push ended the verification: the new head is verified again
+        root = find_repo_root(Path.cwd())
+        run(["git", "fetch", "--quiet", "--prune", "origin"], cwd=root)
+        branch, target, _ = find_branch(root, lcfg, n)
+        head = git_out(root, "rev-parse", "--verify", "--quiet", target) if branch else ""
+        if head and not verification_state(root, lcfg, n, labels, issue_comments(lcfg["github_repo"], n),
+                                           head)["verified"]:
+            return None
+        return f"#{n} is verified by agents at its head already."
+    if "verifying" not in labels or iss["status"] != "In Review":
+        return (f"#{n} isn't waiting for a verifier (status {iss['status'] or '-'}, no label verifying). "
+                "/uat hands a ticket over with `haam.py handover`.")
+    return None
+
+
+def pull_back_to_owner(cfg, board, iss):
+    """owner-test was just added: the owner tests it themselves. A ticket waiting in the agents' lane goes to UAT."""
+    repo, n = cfg["github_repo"], iss["number"]
+    moved = ""
+    if iss["status"] == "In Review" and ({"verifying", "verified-by-agents"} & set(iss["labels"] or [])):
+        board.set_option(iss, "Status", "UAT")
+        moved = "; status UAT (the owner's test)"
+    run(["gh", "issue", "comment", str(n), "-R", repo, "--body",
+         f"{PULLED_BACK_MARK}: the owner tests #{n} themselves (label `{OWNER_TEST_LABEL}`). It leaves the agents' "
+         "lane, and no release takes it until they pass it."])
+    return moved
+
+
+def remote_tip(repo, branch):
+    code, ref_, _ = gh_api("GET", f"repos/{repo}/git/ref/heads/{branch}")
+    return ((ref_ or {}).get("object") or {}).get("sha") if code == 0 and isinstance(ref_, dict) else None
+
+
+def lane_start(args, what):
+    """(root, the folder's config, the lane's config, issue number, repo) for lane / handover / verify-result."""
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    if cfg.get("tracker") != "github":
+        sys.exit(f"{what} reads the issue's labels and comments on GitHub: the agents-verify lane needs the GitHub "
+                 "tracker (Linear: every change stays the owner's test).")
+    run(["git", "fetch", "--quiet", "--prune", "origin"], cwd=root)
+    return root, cfg, lane_config(root), parse_issue_number(args.issue), cfg["github_repo"]
+
+
+def cmd_lane(args):
+    """Who checks this ticket under uat: agents-verify: `agents` (an independent verifier) or `owner` (the owner's own
+    test), with the first reason that applies; and whether a verification still counts."""
+    root, cfg, lcfg, number, repo = lane_start(args, "lane")
+    try:
+        d = lane_details(root, lcfg, number, branch=args.branch)
+        if d["lane"] == "agents":
+            d["verification"] = verification_state(root, lcfg, number, issue_labels(repo, number),
+                                                    issue_comments(repo, number), d["head"])
+    except RuntimeError as e:
+        sys.exit(str(e))
+    if args.json:
+        print(json.dumps(d, indent=2))
+        return
+    print(f"{d['lane']}: {d['reason']}")
+    if d.get("branch") and d.get("head"):
+        print(f"   branch {d['branch']} at {d['head'][:8]}" + (f" · plan {d['plan']}" if d.get("plan") else ""))
+    v = d.get("verification")
+    if v:
+        print(f"   {OK if v['verified'] else INFO} {v['why']}")
+
+
+def cmd_handover(args):
+    """/uat's hand-over (GitHub Projects): the lane decides where a built ticket goes. agents: status In Review, label
+    verifying and `🧪 Ready for verification`; owner: status UAT and `🧪 Ready for UAT` with the reason."""
+    root, cfg, lcfg, number, repo = lane_start(args, "handover")
+    board = GHProject(cfg)
+    try:
+        board.load()
+        iss = board.issue(number)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    if is_claimed(iss) and not claim_is_mine(repo, number, args):
+        sys.exit(f"#{number} is claimed by another chat: only the chat that built it hands it over (from its branch, "
+                 "or with --claim <its id>).")
+    try:
+        branch, target, _ = find_branch(root, cfg, number, args.branch)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    if not branch or not (target or "").startswith("origin/"):
+        sys.exit(f"Push the branch first: the hand-over is what's on GitHub ({branch or 'no branch found'}).")
+    head = git_out(root, "rev-parse", target)
+    try:
+        d = lane_details(root, lcfg, number, labels=iss["labels"], branch=branch, head=head)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    summary = Path(args.body_file).read_text().strip() if args.body_file else ""
+    plan = d["plan"] or find_plan(root, number, branch, head)[0]
+    f = d["plan_fields"]
+    owner = cfg.get("product_owner_github")
+    if d["lane"] == "agents":
+        bad = []
+        if not re.fullmatch(r"[0-9a-f]{40}", (f.get("verified_at") or "").lower()):
+            bad.append("`Verified at: <the 40-character commit your evidence is from>`")
+        elif not verified_head_counts(root, f["verified_at"], head):
+            bad.append(f"`Verified at: {f['verified_at'][:12]}…` differs from the head {head[:8]} in more than "
+                       "docs/uat/ and docs/changes/: run the evidence again at the head and name it")
+        if not re.match(r"(?i)(low|medium|high)\s*[:·-]\s*\S", f.get("risk") or "") or "<" in (f.get("risk") or ""):
+            bad.append("`Risk: low|medium|high: <one line>`")
+        if not f.get("undo") or "<" in f["undo"]:
+            bad.append("`Undo: <how to undo it>`")
+        if bad:
+            sys.exit(f"The plan ({plan}) needs these lines under Agent pre-check before a verifier can take it: "
+                     + "; ".join(bad))
+        try:
+            edit_issue_labels(repo, number, add=["verifying"],
+                              remove=[x for x in ("verify-failed", "verified-by-agents") if x in iss["labels"]])
+        except RuntimeError as e:
+            sys.exit(f"Couldn't label #{number}: {e}")
+        board.set_option(iss, "Status", "In Review")
+        status = "In Review"
+        body = (f"{READY_VERIFY_MARK} · branch `{branch}` · head {head}\n\n"
+                f"Lane: agents ({d['reason']}). Risk: {f['risk']}. Undo: {f['undo']}.\nPlan: `{plan}`"
+                + (f"\n\n{summary}" if summary else ""))
+    else:
+        board.set_option(iss, "Status", "UAT")
+        status = "UAT"
+        fully = re.search(r"(?i)Fully verified by the agent:\**\s*yes", find_plan(root, number, branch, head)[1] or "")
+        body = (f"{READY_UAT_MARK} · your test: {d['reason']} · branch `{branch}` · head {head}\n\n"
+                + ("✔ Fully verified by the agent\n" if fully and setting_value(lcfg, "uat") != "agents-verify" else "")
+                + (f"Plan: `{plan}`" if plan else "") + (f"\n\n{summary}" if summary else "")
+                + (f"\n\n@{owner}" if owner else ""))
+    code, out, err = run(["gh", "issue", "comment", str(number), "-R", repo, "--body", body])
+    if code != 0:
+        sys.exit(f"Couldn't comment on #{number}: {(err or out)[:200]}")
+    res = {"issue": number, "lane": d["lane"], "reason": d["reason"], "status": status, "branch": branch, "head": head,
+           "plan": plan}
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return
+    print(f"{OK} #{number} → {status} ({d['lane']}: {d['reason']})")
+    print("   A verifier takes it: /work verify, or /next." if d["lane"] == "agents" else
+          f"   The owner tests it: /test {number}")
+
+
+def checklist(text):
+    """Each finding of a card as a checklist item."""
+    out = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^(\s*)[-*]\s+(?!\[[ xX]\])(.*)$", line)
+        out.append(f"{m.group(1)}- [ ] {m.group(2)}" if m else line)
+    return "\n".join(out)
+
+
+def verified_ticket_count(repo, exclude=None):
+    """How many tickets were ever verified by agents (label verified-by-agents, open or closed), besides `exclude`."""
+    code, out, _ = run(["gh", "issue", "list", "-R", repo, "--label", "verified-by-agents", "--state", "all",
+                        "--json", "number", "--limit", "1000"])
+    try:
+        nums = {i.get("number") for i in json.loads(out or "[]")} if code == 0 else set()
+    except json.JSONDecodeError:
+        nums = set()
+    return len(nums - {exclude})
+
+
+def cmd_verify_result(args):
+    """The verifier's verdict, recorded with its own marks (never the owner's): verified, not-verified or needs-owner."""
+    root, cfg, lcfg, number, repo = lane_start(args, "verify-result")
+    verdict = args.verdict
+    card = Path(args.body_file).read_text().strip() if args.body_file else ""
+    if not card and verdict != "needs-owner":
+        sys.exit("--body-file <card> is required: what changed, the risk, what was checked, what wasn't, how to undo it "
+                 "(not-verified: the findings, one per line)")
+    if verdict == "needs-owner" and not (args.reason or "").strip():
+        sys.exit("--reason is required for needs-owner: why the owner must test it themselves")
+    board = GHProject(cfg)
+    try:
+        board.load()
+        iss = board.issue(number)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    comments = issue_comments(repo, number)
+    if args.claim in build_claim_tokens(comments):
+        sys.exit(f"claim {args.claim} is the build claim of #{number}: a verifier is never the builder. A fresh chat "
+                 f"claims it to verify: issue claim {number} --for verify")
+    mine = [c for c in active_claims(comments) if claim_token(c.get("body")) == args.claim
+            and VERIFY_CLAIM_WHAT in (c.get("body") or "")]
+    if not mine:
+        sys.exit(f"No verify claim {args.claim} on #{number}. Claim it first: issue claim {number} --for verify")
+    try:
+        branch, _, _ = find_branch(root, cfg, number, args.branch)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    if not branch:
+        sys.exit(f"No branch found for #{number} (add --branch <name>)")
+    if git_out(Path.cwd(), "branch", "--show-current") == branch:
+        sys.exit(f"This worktree has {branch} checked out. A verifier works detached at the handed-over commit "
+                 f"(git switch --detach origin/{branch}) in its own worktree, and never edits the branch.")
+    tip = remote_tip(repo, branch)
+    want = (args.head or "").strip().lower()
+    if not tip or len(want) < 7 or not tip.lower().startswith(want):
+        sys.exit(f"{want or '--head'} isn't the tip of {branch} on GitHub ({(tip or 'not found')[:12]}). The branch "
+                 "moved after the hand-over: verify the new head (or leave it to the next verifier).")
+    head = tip
+    run(["git", "fetch", "--quiet", "origin", branch], cwd=root)
+    try:
+        lane, why = issue_lane(root, lcfg, number, labels=iss["labels"], branch=branch, head=head)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    if lane == "owner":
+        sys.exit(f"#{number}'s lane is owner ({why}): the owner tests it. Release your claim: "
+                 f"issue release {number} --claim {args.claim}")
+    rounds = sum(1 for r in verdict_records(comments) if r["verdict"] == "not-verified")
+    max_rounds = int(setting_value(lcfg, "max_review_rounds") or 2)
+    if verdict != "needs-owner" and rounds >= max_rounds:
+        sys.exit(f"#{number} was sent back {rounds} time(s) (max_review_rounds {max_rounds}): the verdict now is "
+                 "needs-owner, with the reason.")
+    labels = set(iss["labels"] or [])
+    tool = (args.tool or "an agent").strip()
+    if "spot-check" in labels and verdict == "verified":
+        before = [r for r in verdict_records(comments) if r["verdict"] == "verified"]
+        if before and before[-1]["tool"].lower() == tool.lower():
+            sys.exit(f"#{number} is a spot-check: a second verification on another model than the first ({tool}). "
+                     "Pass --tool with this chat's tool and model.")
+    tail = f" · branch `{branch}` · head {head} · claim {args.claim} · {tool}"
+    owner = cfg.get("product_owner_github")
+    when = time.strftime("%Y-%m-%d")
+    res = {"issue": number, "verdict": verdict, "branch": branch, "head": head, "claim": args.claim}
+    if verdict == "verified":
+        nth = verified_ticket_count(repo, exclude=number) + 1
+        shadow_n = int(setting_value(lcfg, "agents_verify_shadow") or 0)
+        shadow = nth <= shadow_n
+        spot_new = "verified-by-agents" not in labels and "spot-check" not in labels and nth % SPOT_CHECK_EVERY == 0
+        code, _, err = gh_api("POST", f"repos/{repo}/statuses/{head}", {
+            "state": "success", "context": VERIFIED_CONTEXT,
+            "description": f"Verified by agents (claim {args.claim}) on {when}"[:140]})
+        if code != 0:
+            sys.exit(f"Couldn't record the verification on the commit: {(err or '')[:200]}")
+        body = f"{VERIFIED_MARK}{tail}\n\n{card}"
+        if shadow:
+            body += (f"\n\nShadow start: verified ticket {nth} of {shadow_n}. The owner still tests it, as before "
+                     f"(`/test {number}`), so the two can be compared." + (f" @{owner}" if owner else ""))
+        if spot_new:
+            body += (f"\n\nSpot-check: every {SPOT_CHECK_EVERY}th verified ticket is verified again by a second "
+                     "verifier on another model (label `spot-check`).")
+        add = ["verified-by-agents"] + (["spot-check"] if spot_new else [])
+        remove = [x for x in ("verifying", "verify-failed", CLAIMED_LABEL) if x in labels]
+        if "spot-check" in labels:
+            remove.append("spot-check")          # the second verification is done
+        status = "UAT" if shadow else "In Review"
+        res.update(shadow=shadow, spot_check=spot_new, nth=nth)
+        extra = []
+    elif verdict == "not-verified":
+        gh_api("POST", f"repos/{repo}/statuses/{head}", {"state": "failure", "context": VERIFIED_CONTEXT,
+                                                         "description": f"Not verified (claim {args.claim}) on {when}"})
+        body = f"{NOT_VERIFIED_MARK}{tail}\n\n{checklist(card)}"
+        add = ["verify-failed"]
+        remove = [x for x in ("verifying", "verified-by-agents", "spot-check", CLAIMED_LABEL) if x in labels]
+        extra = sum((["--remove-assignee", a] for a in iss["assignees"]), [])
+        status = "Ready"
+        res["round"] = rounds + 1
+    else:
+        gh_api("POST", f"repos/{repo}/statuses/{head}", {"state": "failure", "context": VERIFIED_CONTEXT,
+                                                         "description": f"Needs the owner's test (claim {args.claim})"})
+        reason = " ".join(args.reason.split())
+        body = (f"{NEEDS_OWNER_MARK}: {reason}{tail}" + (f"\n\n{card}" if card else "")
+                + (f"\n\n@{owner}" if owner else ""))
+        add = [OWNER_TEST_LABEL]
+        remove = [x for x in ("verifying", "spot-check", CLAIMED_LABEL) if x in labels]
+        extra = []
+        status = "UAT"
+    code, out, err = run(["gh", "issue", "comment", str(number), "-R", repo, "--body", body])
+    if code != 0:
+        sys.exit(f"Couldn't comment on #{number}: {(err or out)[:200]}")
+    try:
+        edit_issue_labels(repo, number, add=add, remove=remove, extra=extra)
+    except RuntimeError as e:
+        sys.exit(f"Recorded the verdict, but couldn't change the labels of #{number}: {e}")
+    if iss["status"] != status:
+        board.set_option(iss, "Status", status)
+    run(["gh", "issue", "comment", str(number), "-R", repo, "--body",
+         f"{RELEASE_MARK} ({args.claim}) · verdict {verdict}" + (f" · status {status}" if status != iss["status"] else "")])
+    res["status"] = status
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return
+    print(f"{OK} #{number}: {verdict} at {head[:8]} → {status}; claim {args.claim} released")
+    if res.get("shadow"):
+        print(f"   Shadow start ({res['nth']} of {setting_value(lcfg, 'agents_verify_shadow')}): the owner tests it too.")
+    if res.get("spot_check"):
+        print("   Picked for a spot-check: /next gives it to a second verifier on another model.")
+
+
+def cmd_hooks(args):
+    root = find_repo_root(Path.cwd())
+    rep = Report()
+    rep.section("Git hooks on this machine")
+    setup_secret_hook(root, args.apply, rep)
+    if not args.apply:
+        rep.add("info", "Plan only. Re-run with --apply to make changes")
+    rep.print(args.json)
+
+
+def cmd_dev(args):
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    rep = Report()
+    rep.section("Tools on this machine")
+    for b, why, how in [
+        ("git", "version control", "https://git-scm.com"),
+        ("gh", "pull requests and checks", "https://cli.github.com, then `gh auth login`"),
+        ("make", "project commands", "macOS: xcode-select --install · Linux: build-essential · Windows: use WSL"),
+        ("gitleaks", "secret scan before every commit (required)", "macOS: brew install gitleaks · others: github.com/gitleaks/gitleaks/releases"),
+    ]:
+        if have(b):
+            rep.add("ok", b, why)
+        else:
+            rep.add("fail", f"{b} missing", why)
+            rep.action(WHO_TERMINAL, f"Install {b}", how)
+    if have("gh"):
+        code, _, _ = run(["gh", "auth", "status"])
+        rep.add("ok" if code == 0 else "fail", "gh logged in" if code == 0 else "gh not logged in")
+        if code != 0:
+            rep.action(WHO_TERMINAL, "Log in to GitHub", "gh auth login")
+    found = [n for n, bins in (("Claude Code", ["claude"]), ("Cursor", ["cursor", "cursor-agent"]),
+                               ("Codex", ["codex"]), ("Grok", ["grok"]), ("Gemini CLI", ["gemini"]))
+             if any(have(x) for x in bins)]
+    rep.add("info", "Agent tools found: " + (", ".join(found) if found else "none on PATH (IDE apps may still be installed)"))
+
+    rep.section("This copy of the repository")
+    if (root / ".githooks/pre-commit").exists():
+        setup_secret_hook(root, args.apply, rep)
+
+    env, example = root / ".env", root / ".env.example"
+    if env.exists():
+        rep.add("ok", ".env exists", "contents not read")
+    elif example.exists():
+        if args.apply:
+            shutil.copy2(example, env)
+            rep.add("ok", ".env created from .env.example", "fill in TEST values")
+        else:
+            rep.add("warn", ".env missing", "will copy from .env.example")
+        rep.action(WHO_TERMINAL, "Put the TEST credentials from the product owner into .env "
+                   "(agents must not read or write this file)")
+    else:
+        rep.add("info", "No .env.example in this project")
+
+    for rel in SKILL_LINKS:
+        p = root / rel
+        rep.add("ok" if p.exists() else "warn", f"{rel} available" if p.exists() else f"{rel} missing",
+                "" if p.exists() else "ask the admin to run `haam.py agents --apply` (or links weren't checked out: "
+                "on Windows enable git symlinks)")
+
+    if args.run_checks:
+        rep.section("Project checks")
+        for target in ("setup", "check"):
+            c2, out, e2 = run(["make", target], cwd=root)
+            rep.add("ok" if c2 == 0 else "fail", f"make {target}", (e2 or out)[-200:] if c2 else "")
+            if c2 != 0:
+                rep.action(WHO_AGENT, f"Investigate why `make {target}` fails and explain it to the developer")
+                break
+
+    rep.section("Accounts and connections")
+    if cfg.get("tracker") == "github":
+        rep.add("info", f"GitHub access to {cfg.get('github_repo') or '(repo)'} and its project board: "
+                        "invitations come from the project admin (`haam.py invite`)")
+        if have("gh"):
+            _, so, se = run(["gh", "auth", "status"])
+            status_text = (so + se).lower()
+            if "project" in status_text:
+                rep.add("ok", "gh login can use GitHub Projects")
+            else:
+                rep.add("warn", "gh login may lack the 'project' scope")
+                rep.action(WHO_TERMINAL, "Let your GitHub login use Projects", "gh auth refresh -s project")
+        rep.action(WHO_AGENT, "Verify the board works: python3 tools/haam/haam.py issue list --status Ready")
+    else:
+        rep.add("info", f"GitHub access to {cfg.get('github_repo') or '(repo)'} and Linear team {cfg.get('team_key')}: "
+                        "invitations come from the project admin (`haam.py invite`)")
+        rep.action(WHO_TERMINAL, "Connect your agent tool to Linear (one-time sign-in)",
+                   "see docs/setup/AGENTS-SETUP.md for your tool")
+        rep.action(WHO_AGENT, "Verify Linear works: list the Ready issues in team " + cfg.get("team_key", ""))
+    rep.action(WHO_AGENT, "Walk the developer through docs/ONBOARDING.md §7–9 and suggest a first issue from the Agent queue")
+    if not args.apply:
+        rep.add("info", "Plan only. Re-run with --apply to make the local changes")
+    rep.print(args.json)
+
+
+# ----------------------------------------------------------------------------- doctor
+
+def cmd_doctor(args):
+    root = find_repo_root(Path.cwd())
+    cfg = load_config(root)
+    rep = Report()
+    admin = args.role == "admin"
+
+    rep.section("HAAM files")
+    lock = load_lock(root)
+    rep.add("ok" if lock.get("kit_version") else "warn", f"Kit version: {lock.get('kit_version') or 'not recorded'}",
+            "" if lock.get("kit_version") else f"no {LOCK_NAME}: run `update` from the kit to start tracking versions")
+    if getattr(args, "check_updates", False):
+        latest = latest_release()
+        if latest and lock.get("kit_version") and version_tuple(latest) > version_tuple(lock["kit_version"]):
+            rep.add("warn", f"Update available: {latest}", f"{KIT_URL}/releases")
+            rep.action(WHO_AGENT, f"Upgrade HAAM to {latest}", "run the /haam-update skill")
+        elif latest:
+            rep.add("ok", f"Up to date with the latest release ({latest})")
+    for rel, what in [("AGENTS.md", "rules for every agent"), ("CLAUDE.md", "Claude pointer"),
+                      ("docs/process/LIFECYCLE.md", "methodology"), ("docs/process/GATES.md", "gates"),
+                      (".github/workflows/review.yml", "AI review"), (".github/workflows/security.yml", "secret scan"),
+                      (".github/workflows/gates.yml", "UAT gate"), (".githooks/pre-commit", "commit hook"),
+                      (CONFIG_NAME, "project config"), (LOCK_NAME, "installed kit version")]:
+        rep.add("ok" if (root / rel).exists() else "fail", rel, what)
+    if not (root / "AGENTS.md").exists():
+        rep.action(WHO_AGENT, "HAAM isn't installed here. Install it from the kit",
+                   "python3 <kit>/tools/haam/haam.py install --target .")
+        rep.print(args.json)
+        return
+    skills = list((root / ".agents/skills").glob("*/SKILL.md"))
+    rep.add("ok" if len(skills) >= 13 else "warn", f"{len(skills)} skills in .agents/skills")
+    gates = root / GATES_WORKFLOW
+    if gates.is_file() and CHANGEOVER_RE.search(gates.read_text(errors="replace")) and main_gates_listens_target(root):
+        rep.add("warn", "The gate's changeover is half done: main's gates.yml decides on pull_request_target, but this "
+                "copy still listens to pull_request too", "a PR can run its own copy of the gate until that goes")
+        rep.action(WHO_AGENT, "Finish the gate's changeover on a branch, then open a PR for it",
+                   "python3 tools/haam/haam.py changeover --apply")
+    if (root / ".haam/incoming").exists() and any((root / ".haam/incoming").rglob("*")):
+        rep.add("warn", "Unmerged kit files in .haam/incoming")
+        rep.action(WHO_AGENT, "Merge the files in .haam/incoming, then delete that folder")
+
+    rep.section("Project configuration")
+    rep.add("ok", f"tracker: {cfg.get('tracker')}" + (" (GitHub Projects)" if cfg.get("tracker") == "github" else " (Linear)"))
+    for k in ("product_name", "github_repo", "product_owner_github"):
+        rep.add("ok" if cfg.get(k) else "fail", f"{k}: {cfg.get(k) or '(not set)'}")
+    rep.add("ok" if cfg["team_key"] != PLACEHOLDER_KEY else "warn", f"team_key: {cfg['team_key']}",
+            "still the placeholder" if cfg["team_key"] == PLACEHOLDER_KEY else "")
+    for k, w in active_windows(root).items():
+        rep.add("info", f"Settings window on this computer: {window_line(k, w)} (normally {configured_value(cfg, k)})",
+                f"ends by itself; settings --clear-window {k} --human ends it early")
+    if cfg["_applied"].get("team_key") != cfg["team_key"]:
+        rep.add("fail", "Team key not applied to the files yet")
+        rep.action(WHO_AGENT, "Apply the config", "python3 tools/haam/haam.py config")
+    if any(not cfg.get(k) for k in ("product_name", "github_repo", "product_owner_github")):
+        rep.action(WHO_AGENT, "Ask the human for the missing values and save them",
+                   "python3 tools/haam/haam.py config --product ... --team-key ... --github-repo ... --owner ...")
+    todos = todo_count(root)
+    rep.add("ok" if not todos else "warn", f"{len(todos)} TODO(setup) placeholders left",
+            ", ".join(todos[:6]) + (" …" if len(todos) > 6 else ""))
+    if todos:
+        rep.action(WHO_AGENT, "Fill the TODO(setup) placeholders from the codebase (Makefile commands, workflow "
+                   "runtime steps, ARCHITECTURE.md) and ask the human for product facts (PRODUCT.md)",
+                   "grep -rn 'TODO(setup)' AGENTS.md Makefile docs .github")
+
+    rep.section("This machine")
+    for b in ("git", "gh", "make", "gitleaks"):
+        rep.add("ok" if have(b) else "fail", b)
+    hook_on = secret_hook_on(root)
+    rep.add("ok" if hook_on else "warn", "commit secret hook " + ("on" if hook_on else "off"))
+    if git_out(root, "config", "core.hooksPath") == ".githooks" and own_git_hooks(root):
+        rep.add("warn", "core.hooksPath = .githooks is switching off this repository's own hooks: "
+                + ", ".join(own_git_hooks(root)), "python3 tools/haam/haam.py hooks --apply chains the scan instead")
+    for rel in SKILL_LINKS:
+        rep.add("ok" if (root / rel).exists() else "warn", rel)
+
+    hidden = ignored_paths(root, sorted((load_lock(root).get("files") or {}).keys()))
+    rep.add("ok" if not hidden else "fail", "Kit files committed (not hidden by .gitignore)",
+            "" if not hidden else "hidden: " + ", ".join(sorted(hidden)[:6]))
+    if hidden:
+        rep.action(WHO_AGENT, "Re-include the hidden kit files: re-run the kit's update (it adds .gitignore negations), "
+                   "then commit them", "python3 <kit>/tools/haam/haam.py update --target . --apply")
+
+    rep.section("Parallel chats")
+    _, main_dir, linked = git_paths(root)
+    rep.add("info", "This chat has its own worktree" if linked else "This is the main folder",
+            "" if linked else "agent chats that change code: start them with /work")
+    rep.add("ok" if (main_dir / WORKTREE_INCLUDE).exists() else "warn", WORKTREE_INCLUDE,
+            "lists local files (like .env) to copy into each new worktree")
+    wt_label = worktree_dir_label(cfg)
+    # Only the in-repo default needs a .gitignore entry; a sibling folder (../…) is outside the repo.
+    if not wt_label.startswith("..") and not Path(wt_label).is_absolute():
+        ignored = run(["git", "check-ignore", "-q", f"{wt_label}/x"], cwd=main_dir)[0] == 0
+        rep.add("ok" if ignored else "warn", f"{wt_label}/ is git-ignored")
+        if not ignored:
+            rep.action(WHO_AGENT, f"Add `{wt_label}/` to .gitignore")
+    else:
+        rep.add("info", f"Worktrees live at {wt_label}", "outside the repo (worktree_dir)")
+    others = [w for w in list_worktrees(root, cfg) if not w["main"]]
+    if others:
+        rep.add("info", f"{len(others)} other worktree(s)", "python3 tools/haam/haam.py worktree list")
+    for level, text, detail in heavy_lock_report(root):
+        rep.add(level, text, detail)
+    tool_own = (main_dir / ".haam").resolve()      # ship's and local-ci's short-lived checkouts
+    stray_w = [w for w in others if not w["haam_area"] and tool_own not in Path(w["path"]).resolve().parents]
+    stray = sorted({str(Path(w["path"]).parent) for w in stray_w})
+    if stray:
+        n = len(stray_w)
+        rep.add("warn", f"{n} worktree(s) outside {wt_label}: worktree clean never removes them",
+                "in " + ", ".join(stray[:3]) + (" …" if len(stray) > 3 else "")
+                + ". If your project's rules tell agents to use another folder, point them at "
+                f"{wt_label} (or set worktree_dir to it)")
+        rep.action(WHO_AGENT, "See which of them are finished, then remove those with --apply",
+                   "python3 tools/haam/haam.py worktree clean " + " ".join(f"--also {shlex.quote(d)}" for d in stray[:3]))
+
+    if admin and have("gh") and cfg.get("github_repo") and run(["gh", "auth", "status"])[0] == 0:
+        repo = cfg["github_repo"]
+        rep.section(f"GitHub ({repo})")
+        code, out, _ = run(["gh", "label", "list", "-R", repo, "--json", "name", "-L", "200"])
+        have_labels = {l["name"] for l in json.loads(out)} if code == 0 and out else set()
+        miss = [n for n, _, _ in GITHUB_LABELS if n not in have_labels]
+        rep.add("ok" if not miss else "warn", "Labels", "missing: " + ", ".join(miss) if miss else "")
+        code, rs, _ = gh_api("GET", f"repos/{repo}/rulesets")
+        ok_rs = code == 0 and isinstance(rs, list) and any(r.get("name") == "HAAM main protection" for r in rs)
+        rep.add("ok" if ok_rs else "warn", "Branch ruleset with required checks")
+        code, _, _ = gh_api("GET", f"repos/{repo}/environments/production")
+        rep.add("ok" if code == 0 else "warn", "Production environment")
+        code, out, _ = run(["gh", "secret", "list", "-R", repo, "--json", "name"])
+        has_key = code == 0 and ("ANTHROPIC_API_KEY" in out or "CLAUDE_CODE_OAUTH_TOKEN" in out)
+        rep.add("ok" if has_key else "warn", "Reviewer key (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)")
+        if miss or not ok_rs or not has_key:
+            rep.action(WHO_AGENT, "Show the GitHub plan, get the human's OK, then apply",
+                       "python3 tools/haam/haam.py github  →  python3 tools/haam/haam.py github --apply")
+    elif admin:
+        rep.section("GitHub")
+        rep.add("warn", "Not checked", "needs gh logged in and github_repo set")
+
+    if admin and cfg.get("tracker") == "github":
+        rep.section("Tracker: GitHub Projects")
+        if not cfg.get("github_project_number"):
+            rep.add("fail", "No board configured")
+            rep.action(WHO_AGENT, "Create and configure the board (show the plan, then apply on the human's OK)",
+                       "python3 tools/haam/haam.py github-project  →  --apply")
+        elif have("gh") and run(["gh", "auth", "status"])[0] == 0:
+            try:
+                board = GHProject(cfg)
+                proj = board.load()
+                st = [o["name"] for o in (board.field("Status") or {}).get("options") or []]
+                rep.add("ok", f"Board #{proj['number']}", proj["url"])
+                rep.add("ok" if st == [n for n, _, _ in GH_STATUSES] else "warn", "Status field has the 12 HAAM statuses")
+                rep.add("ok" if board.field("Priority") else "warn", "Priority field")
+            except RuntimeError as e:
+                rep.add("warn", "Couldn't read the board", str(e)[:160])
+            code, out, _ = run(["gh", "secret", "list", "-R", cfg["github_repo"], "--json", "name"])
+            rep.add("ok" if code == 0 and PROJECT_TOKEN_SECRET in out else "warn",
+                    f"{PROJECT_TOKEN_SECRET} secret (moves cards on PR open/merge)")
+    elif admin:
+        rep.section("Linear")
+        if os.environ.get("LINEAR_API_KEY"):
+            rep.add("info", "Run `haam.py linear` to compare the team setup")
+        else:
+            rep.add("info", "Not checked from here (needs your Linear API key)")
+            rep.action(WHO_TERMINAL, "Check/apply the Linear setup yourself (asks for your key securely)",
+                       "python3 tools/haam/haam.py linear  →  then with --apply")
+    rep.print(args.json)
+
+
+# ----------------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="haam", description="HAAM setup tool " + VERSION)
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    def common(p):
+        p.add_argument("--json", action="store_true", help="machine-readable output for agents")
+        return p
+
+    p = common(sub.add_parser("install", help="copy the kit into a repository"))
+    p.add_argument("--target", required=True)
+    p.add_argument("--language", choices=list(LANGUAGES), help="language of the docs for people (default en); agent "
+                   "instructions stay in English")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_install)
+
+    p = common(sub.add_parser("update", help="upgrade a project to this kit version"))
+    p.add_argument("--target", required=True)
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="same as leaving out --apply")
+    p.set_defaults(func=cmd_update)
+
+    p = common(sub.add_parser("version", help="show kit versions"))
+    p.add_argument("--check", action="store_true", help="also look up the latest release (needs internet)")
+    p.set_defaults(func=cmd_version)
+
+    p = common(sub.add_parser("config", help="create/update haam.config.json"))
+    p.add_argument("--human", action="store_true", help="the owner chose these settings in this session")
+    p.add_argument("--product")
+    p.add_argument("--language", choices=list(LANGUAGES), help="the language agents use with people, in the tracker "
+                   "and in docs; then run the kit's update to switch the installed docs")
+    p.add_argument("--team-key")
+    p.add_argument("--linear-team")
+    p.add_argument("--github-repo")
+    p.add_argument("--owner", help="product owner's GitHub username")
+    p.add_argument("--backup-approvers", help="comma-separated GitHub usernames")
+    p.add_argument("--production-url")
+    p.add_argument("--agents", help="comma-separated: claude,cursor,codex,grok,gemini")
+    p.add_argument("--tracker", help="github (GitHub Projects) or linear")
+    p.add_argument("--project-number", help="existing GitHub Projects board number to use")
+    p.add_argument("--project-owner", help="GitHub user/org that owns the board (default: repo owner)")
+    p.add_argument("--deploy", help="github (deploy.yml on merge, default) or manual (you deploy by hand)")
+    p.add_argument("--flow", help="test-first (default: owner tests before the PR) or checks-first")
+    p.add_argument("--heavy-run", action="append", help="add a heavy run (regex on what each process runs itself, "
+                   "never a shell's -c text) for haam.py exclusive, e.g. 'make (check|test-integration)' (repeatable)")
+    p.add_argument("--clear-heavy-runs", action="store_true", help="empty the heavy_runs list")
+    p.add_argument("--production", help="what counts as production code: path patterns, comma-separated, replacing "
+                   "the list (default: everything, e.g. 'src/**,api/**')")
+    p.add_argument("--not-production", help="add path patterns that are never production code (prototypes, tests…)")
+    p.add_argument("--remove-not-production", help="remove patterns from the not-production list, e.g. 'docs/**' "
+                   "when your docs site is what users see")
+    p.add_argument("--release-target", action="append", metavar="NAME=PATTERNS",
+                   help="a build that ships on its own (a phone app): its paths, for /cadence (e.g. "
+                        "ios='apps/ios/**,packages/core/**'); repeatable, replaces that name's patterns")
+    p.add_argument("--clear-release-targets", action="store_true", help="remove every release target")
+    p.add_argument("--protected", help="add protected path patterns, comma-separated (e.g. 'src/auth/**,db/migrations/**')")
+    p.add_argument("--unprotected", help="remove protected path patterns, comma-separated")
+    p.add_argument("--max-open-prs", type=int, help="agents hold new builds at this many ready PRs (default 10; drafts "
+                   "and docs-only PRs don't count)")
+    p.add_argument("--max-in-uat", type=int, help="...or at this many changes waiting for you to test (default 10)")
+    p.add_argument("--until", help="with --max-in-uat / --max-open-prs: a batch window on this computer, a raise that "
+                   "ends by itself after this day (YYYY-MM-DD) or moment (YYYY-MM-DDTHH:MM)")
+    p.add_argument("--end-batch-window", action="store_true", help="end the batch window now (both limits' windows "
+                   "on this computer, and an older one in haam.config.json)")
+    p.add_argument("--required-fields", help="board fields every new issue must get on create, comma-separated "
+                   "(e.g. 'Area,Kind,Code check'); empty clears the requirement. Needs --human")
+    p.add_argument("--required-epic-fields", help="board fields every new epic must get (default: the issue list "
+                   "without Code check). Empty string clears to []. Needs --human")
+    p.add_argument("--worktree-dir", help="folder for agents' worktrees relative to the main checkout "
+                   "(default .claude/worktrees; e.g. ../connect-wt). Needs --human")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_config)
+
+    for name, fn, h in (("agents", cmd_agents, "wire up agent tools"),
+                        ("github", cmd_github, "configure GitHub gates"),
+                        ("linear", cmd_linear, "configure Linear")):
+        p = common(sub.add_parser(name, help=h))
+        p.add_argument("--apply", action="store_true")
+        if name == "github":
+            p.add_argument("--reset", action="store_true", help="replace the HAAM ruleset with HAAM's defaults "
+                           "instead of adding only what's missing")
+        p.set_defaults(func=fn)
+
+    p = common(sub.add_parser("github-project", help="set up the GitHub Projects board (tracker: github)"))
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--force-status", action="store_true", help="replace Status options even if the board has items")
+    p.set_defaults(func=cmd_github_project)
+
+    p = common(sub.add_parser("issue", help="work with issues on the GitHub Projects board (for agents)"))
+    p.add_argument("action", choices=["list", "stale", "create", "view", "add", "claim", "release", "status", "priority",
+                                      "label", "comment", "close", "link", "unlink", "children", "edit", "fields"])
+    p.add_argument("number", nargs="?", help="issue number (#123 or 123)")
+    p.add_argument("value", nargs="?", help="new status or priority")
+    p.add_argument("--title")
+    p.add_argument("--body")
+    p.add_argument("--body-file")
+    p.add_argument("--stream", choices=["idea", "feature", "bug"], default="idea")
+    p.add_argument("--priority", choices=[n for n, _, _ in GH_PRIORITIES])
+    p.add_argument("--status", action="append", help="list: filter by status (repeatable); create: initial status")
+    p.add_argument("--label", action="append", help="list: must have label; create: extra label (repeatable)")
+    p.add_argument("--no-label", action="append", help="list: must not have label (repeatable)")
+    p.add_argument("--field", action="append", metavar="NAME=VALUE",
+                   help="create/edit: set one of the board's own fields (e.g. Area=Billing, Estimate=3, "
+                        "Due=2026-11-30, Sprint=@current; empty value clears it); list: only items with that value. "
+                        "Repeatable. `issue fields` lists them")
+    p.add_argument("--unassigned", action="store_true")
+    p.add_argument("--epic", action="store_true", help="create: make the new issue an epic (label 'epic')")
+    p.add_argument("--parent", help="create/link: the epic this issue belongs to; list: only that epic's issues")
+    p.add_argument("--no-parent", action="store_true", help="list: only issues that aren't in an epic")
+    p.add_argument("--open-only", action="store_true")
+    p.add_argument("--add", action="append", help="label: add (repeatable)")
+    p.add_argument("--remove", action="append", help="label: remove (repeatable)")
+    p.add_argument("--tool", help="claim: agent tool, e.g. 'Claude Code'")
+    p.add_argument("--machine", help="claim: which computer, e.g. 'desktop'")
+    p.add_argument("--branch", help="claim: branch name")
+    p.add_argument("--for", dest="for_", choices=["build", "assess", "spec", "spike", "verify"],
+                   help="claim: what this chat is about to do (default build)")
+    p.add_argument("--claim", help="release/status: this chat's claim id (printed by claim, and in its comment)")
+    p.add_argument("--force", action="store_true", help="claim: allow a non-Ready issue (bugs); status: move an issue "
+                   "another chat has claimed (only when the human asked)")
+    p.add_argument("--human", action="store_true", help="a human ran the human-only skill for this change")
+    p.add_argument("--stale", action="store_true", help="release: another chat's claim quiet for stale_claim_days "
+                   "(no comment, no commit on its branch); refused when that setting is 0 or it isn't that quiet")
+    p.add_argument("--days", type=float, help="stale: list claims quiet this many days (default: stale_claim_days, "
+                   f"or {STALE_CLAIM_LIST_DAYS} when that is 0)")
+    p.set_defaults(func=cmd_issue)
+
+    p = sub.add_parser("sync-pr", help=argparse.SUPPRESS)
+    p.add_argument("--pr", required=True, type=int)
+    p.add_argument("--event", required=True, choices=["opened", "merged"])
+    p.set_defaults(func=cmd_sync_pr)
+
+    p = common(sub.add_parser("checkout-pr", help="put an issue's change on this machine to test it (detached)"))
+    p.add_argument("issue", nargs="?", help="issue number (#12) or Linear ID (APP-12)")
+    p.add_argument("--back", action="store_true", help="return to the main branch after testing")
+    p.add_argument("--branch", help="test this branch (no PR yet, and it isn't named after the issue)")
+    p.set_defaults(func=cmd_checkout_pr)
+
+    p = common(sub.add_parser("publish", help="test-first: after the owner's pass, push the tested commit and open the PR"))
+    p.add_argument("issue", help="issue number (#12) or Linear ID (APP-12)")
+    p.add_argument("--human", action="store_true", help="the human said 'pass' in this session")
+    p.add_argument("--also", help="batch: the other issues in the same branch, comma-separated")
+    p.add_argument("--title", help="PR title after the IDs (default: the issue's title)")
+    p.add_argument("--label", action="append", help="extra PR label, e.g. human-review (Linear: when the issue has it)")
+    p.set_defaults(func=cmd_publish)
+
+    p = common(sub.add_parser("test-failed", help="the owner's test failed: withdraw any earlier pass of that commit"))
+    p.add_argument("issue", help="issue number (#12) or Linear ID (APP-12)")
+    p.add_argument("--human", action="store_true", help="the human said it failed in this session")
+    p.set_defaults(func=cmd_test_failed)
+
+    p = common(sub.add_parser("ship", help="after UAT passed and the human said ship: merge, deploy, close"))
+    p.add_argument("issue", nargs="*", help="issue number(s) (#12) or Linear ID(s) (APP-12); several: one deploy for all")
+    p.add_argument("--all", action="store_true",
+                   help="everything ready: PRs that passed UAT or are in the no-UAT lane, and merged ones waiting to deploy")
+    p.add_argument("--merge-only", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--release-pr", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--pr-number", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--abandon-release", action="store_true",
+                   help="grouping release: close the open release PR and build a new one from what has passed")
+    p.add_argument("--released-in", help=argparse.SUPPRESS)
+    p.add_argument("--human", action="store_true", help="the human said 'ship' in this session")
+    p.add_argument("--wait", type=float, default=1.5, help="minutes to wait before handing back (exit 2: run again)")
+    p.add_argument("--merged-only", action="store_true", help="/release: never merge, only finish an already-merged PR")
+    p.add_argument("--workflow", default="deploy.yml", help="the deploy workflow file")
+    p.add_argument("--live", action="store_true", help="the human confirmed it's live (manual deploys)")
+    p.add_argument("--deployed", help="with --live: the commit the deploy took (default: origin's main now); every "
+                   "release it contains is closed")
+    p.add_argument("--plan", action="store_true", help="show what ship would do (the release's exact changes, in "
+                   "order, what is left out and why, clashes, files, protected areas, migrations); change nothing")
+    p.add_argument("--first", action="append", metavar="ID", help="grouping release: put this change in first (repeat "
+                   "for an order); a passed change it clashes with is left out")
+    p.add_argument("--without", action="append", metavar="ID", help="grouping release: leave this passed change out "
+                   "of the release (it stays passed for the next one)")
+    p.add_argument("--no-deploy", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_ship)
+
+    p = common(sub.add_parser("cadence", help="whether a release (or a target's build) is due by the owner's cadence"))
+    p.add_argument("--built", metavar="TARGET", help="record the owner's build of this release target (with --human)")
+    p.add_argument("--sha", help="with --built: the commit the build took (default: origin's main now)")
+    p.add_argument("--human", action="store_true", help="the owner said the build is done, in this session")
+    p.set_defaults(func=cmd_cadence)
+
+    p = common(sub.add_parser("lane", help="uat: agents-verify: who checks this ticket, agents or the owner, and why"))
+    p.add_argument("issue", help="issue number (#12)")
+    p.add_argument("--branch", help="the ticket's branch, when it isn't named after the issue")
+    p.set_defaults(func=cmd_lane)
+
+    p = common(sub.add_parser("handover", help="/uat: hand a built ticket over by its lane (verifier or owner)"))
+    p.add_argument("issue", help="issue number (#12)")
+    p.add_argument("--branch", help="the ticket's branch, when it isn't named after the issue")
+    p.add_argument("--claim", help="this chat's build claim id (when it isn't on the branch)")
+    p.add_argument("--body-file", help="the 3-5 line summary for the comment")
+    p.set_defaults(func=cmd_handover)
+
+    p = common(sub.add_parser("verify-result", help="the verifier's verdict, with its own marks (never the owner's)"))
+    p.add_argument("issue", help="issue number (#12)")
+    p.add_argument("--verdict", required=True, choices=["verified", "not-verified", "needs-owner"])
+    p.add_argument("--head", required=True, help="the commit you verified: the branch's tip on GitHub")
+    p.add_argument("--claim", required=True, help="your verify claim's id (issue claim <n> --for verify)")
+    p.add_argument("--body-file", help="the card (verified), the findings one per line (not-verified)")
+    p.add_argument("--reason", help="needs-owner: why the owner must test it")
+    p.add_argument("--tool", help="your agent tool and model, e.g. 'Claude Code, <model>'")
+    p.add_argument("--branch", help="the ticket's branch, when it isn't named after the issue")
+    p.set_defaults(func=cmd_verify_result)
+
+    p = common(sub.add_parser("protected", help="list changed files in protected areas (human-review, never the no-UAT lane)"))
+    p.add_argument("--base", help="compare with this ref (default: origin/main)")
+    p.add_argument("--check", action="store_true", help="exit 1 if any protected file changed")
+    p.set_defaults(func=cmd_protected)
+
+    p = common(sub.add_parser("production", help="list changed files that are production code (what runs for users)"))
+    p.add_argument("--base", help="compare with this ref (default: origin/main)")
+    p.add_argument("--check", action="store_true", help="exit 1 if any production file changed")
+    p.set_defaults(func=cmd_production)
+
+    p = common(sub.add_parser("hooks", help="turn on the commit secret scan without switching off your own git hooks"))
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_hooks)
+
+    p = common(sub.add_parser("overlap", help="branches waiting for the owner's test that change the same files"))
+    p.add_argument("--files", help="the new work's likely files or folders, comma-separated (from its spec); "
+                   "folders end in / and globs work (src/auth/**)")
+    p.add_argument("--branch", action="append", help="a waiting branch to compare (Linear; default: the board's UAT items)")
+    p.set_defaults(func=cmd_overlap)
+
+    p = common(sub.add_parser("capacity", help="should agents start new work? open PRs and UAT queue vs limits"))
+    p.add_argument("--in-uat", type=int, help="Linear: how many issues are in UAT (counted with the Linear connection)")
+    p.add_argument("--list", action="store_true", help="list the PRs and issues it counted")
+    p.set_defaults(func=cmd_capacity)
+
+    p = common(sub.add_parser("ci-usage", help="where the GitHub Actions minutes went"))
+    p.add_argument("--days", type=int, default=7)
+    p.add_argument("--max-runs", type=int, default=500)
+    p.add_argument("--repo", help="owner/name (default: github_repo from haam.config.json)")
+    p.set_defaults(func=cmd_ci_usage)
+
+    p = common(sub.add_parser("metrics", help="how the work flows: time to Done, time in each queue, reruns, defects, reverts"))
+    p.add_argument("--days", type=int, default=30, help="issues active in the last N days (default 30)")
+    p.add_argument("--max-issues", type=int, default=600)
+    p.add_argument("--save", action="store_true", help="also write docs/metrics/<today>.md")
+    p.set_defaults(func=cmd_metrics)
+
+    p = common(sub.add_parser("settings", help="your choices for this project (CI, reviews, testing, shipping, limits)"))
+    p.add_argument("--set", action="append", help="change one: key=value (repeat for more)")
+    p.add_argument("--explain", action="store_true", help="show every option and its trade-off")
+    p.add_argument("--apply", action="store_true", help="sync GitHub: variables, required checks, production approval")
+    p.add_argument("--human", action="store_true", help="the owner chose these settings in this session (/haam-settings)")
+    p.add_argument("--until", help="with --set on a limit (max_in_uat, max_open_prs, max_review_rounds, max_pr_lines): "
+                   "a window on this computer that counts at once and ends by itself after this day (YYYY-MM-DD) or "
+                   "at this moment (YYYY-MM-DDTHH:MM, local time); haam.config.json keeps the normal value")
+    p.add_argument("--clear-window", action="append", metavar="KEY", help="end a limit's window early (repeat for more)")
+    p.add_argument("--recommend", action="store_true", help="suggest the limits for your team (changes nothing)")
+    p.add_argument("--flow", choices=["test-first", "checks-first"], help="recommend: the testing order (default: "
+                   "this project's setting)")
+    p.add_argument("--builders", type=int, default=1, help="recommend: people running agent chats")
+    p.add_argument("--chats", type=int, default=3, help="recommend: agent chats each builder runs at once")
+    p.add_argument("--testing-hours", type=float, default=5, help="recommend: the owner's testing hours a week")
+    p.add_argument("--sittings", type=int, default=5, help="recommend: testing sittings a week")
+    p.add_argument("--minutes-per-test", type=float, default=6, help="recommend: minutes one test takes, on average")
+    p.add_argument("--changes-per-chat", type=float, default=2, help="recommend: changes one agent chat finishes a "
+                   "day (measure yours: issues completed a day ÷ chats)")
+    p.set_defaults(func=cmd_settings)
+
+    p = common(sub.add_parser("local-ci", help="ci = local: run make check on the PR's commit here and post ci-local"))
+    p.add_argument("issue", nargs="?", help="issue number (#12) or Linear ID")
+    p.add_argument("--pr", type=int, help="the PR number instead of the issue")
+    p.add_argument("--timeout", type=float, default=30, help="minutes")
+    p.set_defaults(func=cmd_local_ci)
+
+    p = common(sub.add_parser("ci-settings", help="older name for settings --set runner=… / review=…"))
+    p.add_argument("--runner", help="github (default) or a self-hosted runner label, e.g. self-hosted")
+    p.add_argument("--review", help="github (default) or local (haam.py review on this computer)")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--human", action="store_true", help="the owner chose this in this session")
+    p.set_defaults(func=cmd_ci_settings)
+
+    p = common(sub.add_parser("review", help="run the AI reviews locally in fresh sessions and post the statuses"))
+    p.add_argument("issue", nargs="?", help="issue number (#12) or Linear ID")
+    p.add_argument("--pr", type=int, help="the PR number instead of the issue")
+    p.add_argument("--only", choices=["ai-review", "security-review"])
+    p.add_argument("--timeout", type=float, default=15, help="minutes per review")
+    p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("exclusive", help="run a heavy command when no other one is running on this machine")
+    p.add_argument("who", nargs="?", help="who is asking, for the others' messages, e.g. 'chat A, #12'")
+    p.add_argument("--timeout", type=float, default=60, help="minutes to wait before giving up (exit 124)")
+    p.add_argument("--quiet", type=float, default=10, help="seconds with no other heavy run before starting")
+    p.add_argument("--max-run", type=float, default=None,
+                   help=f"minutes the command may run before it and everything it started are stopped (exit "
+                        f"{RUN_CEILING_EXIT}); a run sent to the other machine gets {REMOTE_MAX_RUN_MINUTES:g} unless given")
+    p.add_argument("--report", action="store_true",
+                   help="no command: per day, how long runs here waited for the machine and ran (from the run log)")
+    p.add_argument("--days", type=int, default=7, help="--report: how many days back (default 7)")
+    p.add_argument("--json", action="store_true", help="--report: as JSON")
+    p.add_argument("command", nargs=argparse.REMAINDER, help="-- then the command, e.g. -- make check")
+    p.set_defaults(func=cmd_exclusive)
+
+    p = common(sub.add_parser("worktree", help="one worktree per agent chat (parallel work on one machine)"))
+    p.add_argument("action", choices=["status", "new", "prep", "list", "clean"])
+    p.add_argument("name", nargs="?", help="new: worktree name (default: agent-xxxx)")
+    p.add_argument("--base", help="new: start from this ref (default: origin's default branch)")
+    p.add_argument("--apply", action="store_true", help="clean: actually remove finished worktrees")
+    p.add_argument("--also", action="append", metavar="FOLDER",
+                   help="list/clean: also treat worktrees in FOLDER as agents' (one an older rule had them use)")
+    p.set_defaults(func=cmd_worktree)
+
+    p = common(sub.add_parser("invite", help="invite a developer"))
+    p.add_argument("--github", required=True, help="their GitHub username")
+    p.add_argument("--linear-email")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_invite)
+
+    p = sub.add_parser("changeover", help="finish the gate's changeover (gates.yml on pull_request_target alone)")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_changeover)
+
+    p = common(sub.add_parser("doctor", help="check setup status"))
+    p.add_argument("--role", choices=["admin", "developer"], default="developer")
+    p.add_argument("--check-updates", action="store_true", help="look up the latest kit release (needs internet)")
+    p.set_defaults(func=cmd_doctor)
+
+    p = common(sub.add_parser("dev", help="developer onboarding on this machine"))
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--run-checks", action="store_true", help="also run make setup and make check")
+    p.set_defaults(func=cmd_dev)
+
+    args = ap.parse_args()
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet exit when output is piped to `head`
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
