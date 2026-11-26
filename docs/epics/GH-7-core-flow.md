@@ -1,6 +1,6 @@
 # Epic brief: #7 Verify My Client core flow: request, client link, minimal disclosure, verified result, audit
 
-- **Epic issue:** #7 · **Status:** Triage
+- **Epic issue:** #7 · **Status:** Backlog
 - **Owner:** @amir-terminal · **Last updated:** 2026-11-26
 
 ## Problem and who it's for
@@ -95,4 +95,8 @@ Nothing blocking is open.
 **For G1 (not in this interview):** storage option A / B / C / D / defer.
 
 ## Decision
-Not decided yet. At G1: approve, park or reject; storage option (A–D or defer). Suggested priority: **High** for the epic and all five slices.
+**Approved at G1 on 2026-11-26 by @amir-terminal**, priority **High** for the epic and all five slices, which moved to Backlog as `stream:feature`. Recorded in [ADR 0003](../decisions/0003-core-flow-storage-and-data-handling.md):
+- Build slice by slice (#8 → #12), one PR each; no epic build mode.
+- Storage: **B**, SQLite with stdlib `sqlite3`; the audit must survive a restart.
+- Client-link tokens: plain `/client/<token>` links, tokens redacted from the access log (in place from #9).
+- The expected name and address are deleted once the yes/no result exists.
