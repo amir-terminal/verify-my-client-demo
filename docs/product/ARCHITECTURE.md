@@ -3,12 +3,12 @@
 > Agents read this at the start of every session (imported by `AGENTS.md`). It is a **map**, not full documentation: enough for a new agent to find its way in two minutes.
 > Agents keep it current: if your PR changes structure or you discover a gotcha, update this file in the same PR.
 
-> **Status (2026-11-25):** no application code yet. The stack below is decided; the layout, modules and data model get filled in by the first PRs that create them.
+> **Status (2026-11-26):** project skeleton only (#5): a FastAPI app with `GET /health`, no business logic yet. The layout, modules and data model get filled in by the PRs that create them.
 
 ## Stack
-- Language / framework: Python 3.13 (`.python-version`), FastAPI
-- Packaging: [uv](https://docs.astral.sh/uv/) (`pyproject.toml` + committed `uv.lock`; CI runs `uv sync --locked`)
-- Lint / format: ruff · Types: mypy · Tests: pytest
+- Language / framework: Python 3.13 (`.python-version`), FastAPI (`fastapi[standard]`, which brings the `fastapi dev` CLI)
+- Packaging: [uv](https://docs.astral.sh/uv/) (`pyproject.toml` + committed `uv.lock`; CI runs `uv sync --locked`). Non-packaged project: no `[build-system]`, so `make build` prints "nothing to build" and passes.
+- Lint / format: ruff (default rules) · Types: mypy, `strict = true` · Tests: pytest (+ httpx for `TestClient`). Dev tools are in `[dependency-groups] dev`, which `uv sync` installs by default.
 - Database: not chosen yet
 - Hosting / deploy target: not chosen yet (`deploy: manual` in `haam.config.json`)
 - Key external services: none yet
@@ -16,16 +16,18 @@
 ## Repository layout
 ```
 .agents/ .claude/ .github/ tools/haam/   HAAM kit: agent skills, settings, workflows, tooling (protected)
+app/                                     Production code (FastAPI app)
+tests/                                   pytest tests (synthetic data only)
 docs/product/                            PRODUCT.md, ARCHITECTURE.md (this file)
 docs/process/ docs/setup/                How we work; setup guides
+pyproject.toml uv.lock                   Dependencies and tool config (ruff, mypy, pytest)
 Makefile                                 The command contract: setup, dev, test, lint, typecheck, build, check, audit
-(app code: not created yet)
 ```
 
 ## Main modules
 | Module / path | Responsibility | Protected area? |
 |---|---|---|
-| _none yet_ | | |
+| `app/main.py` | Creates the FastAPI `app` (module-level, so `fastapi dev` finds it); `GET /health` returns exactly `{"status": "ok"}` | No |
 
 ## Data model (key entities)
 Not defined yet.
@@ -40,19 +42,14 @@ Not defined yet.
 - Env vars are documented in `.env.example` (never commit real values).
 
 ## Testing
-- Unit tests run with `make test` (`uv run pytest -q`); location to be set by the first app PR (suggested: `tests/`).
+- Unit tests live in `tests/` and run with `make test` (`uv run pytest -q`). `pythonpath = ["."]` lets tests `import app` without packaging.
+- API tests use `fastapi.testclient.TestClient(app)`.
 - Synthetic test fixtures only: never real personal data.
 - E2E / browser: none.
 
 ## Gotchas
-- **Makefile guard:** every target skips with "No pyproject.toml yet" until `pyproject.toml` exists. Once it does, `uv.lock` must be committed too, or `make setup` (`uv sync --locked`) fails.
-- **Agent worktrees live in `.claude/worktrees/`.** ruff skips them through `.gitignore`, but pytest and mypy don't. The PR that creates `pyproject.toml` must add:
-  ```toml
-  [tool.pytest.ini_options]
-  testpaths = ["tests"]
-  norecursedirs = [".claude", ".venv", "prototypes"]
-
-  [tool.mypy]
-  exclude = ['^\.claude/', '^prototypes/']
-  ```
-- `make dev` relies on `fastapi dev` auto-discovery (`main.py` or `app/main.py`); needs the `fastapi[standard]` extra.
+- **Exclusions are exactly `tools/haam`, `prototypes` and `.venv`** in ruff (`extend-exclude`), mypy (`exclude`) and pytest (`addopts --ignore=…`). The kit's `tools/haam/haam.py` fails this project's ruff and mypy settings; don't reformat or fix it, keep it excluded.
+- **Agent worktrees in `.claude/worktrees/` need no exclusion:** ruff skips them through `.gitignore`, mypy skips dot-folders, and pytest only collects from `testpaths = ["tests"]`. (Checked in #5 with a deliberately broken file there.)
+- **`ruff format --check` also checks Python code blocks in Markdown** (ruff 0.17 includes `*.md` by default, so the whole `docs/` and kit docs). A badly formatted ` ```python ` block in a doc fails `make lint`.
+- **`uv.lock` must be committed** and kept current (`uv lock` after editing dependencies), or `make setup` (`uv sync --locked`) fails.
+- `make dev` relies on `fastapi dev` auto-discovery of `app/main.py`; needs the `fastapi[standard]` extra.

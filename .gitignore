@@ -12,3 +12,7 @@ AGENTS.local.md
 # HAAM tool: personal credentials never live in the repo
 .haam/
 # --- /HAAM ---
+
+# Python
+__pycache__/
+*.pyc

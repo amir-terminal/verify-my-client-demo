@@ -1,0 +1,33 @@
+[project]
+name = "verify-my-client"
+version = "0.1.0"
+description = "Privacy-first client verification service (demo prototype, synthetic data only)"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]>=0.165.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "ruff>=0.17.6",
+]
+
+# Kit code (tools/haam), throwaway prototypes and the virtualenv are not
+# checked. Agent worktrees under .claude/ need no entry: ruff skips them via
+# .gitignore, mypy skips dot-folders, pytest only collects from tests/.
+[tool.ruff]
+target-version = "py313"
+extend-exclude = ["tools/haam", "prototypes", ".venv"]
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+exclude = ['^tools/haam/', '^prototypes/', '^\.venv/']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = ["--ignore=tools/haam", "--ignore=prototypes", "--ignore=.venv"]

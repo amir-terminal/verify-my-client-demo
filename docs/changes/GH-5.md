@@ -1,0 +1,1 @@
+- #5: The app now exists as a minimal FastAPI service with a `/health` check, and the project's lint, type, test and audit checks run for real.
