@@ -18,14 +18,14 @@ FULL_BODY: dict[str, Any] = {
 }
 
 
-def row_counts(db_path: Path) -> tuple[int, int]:
-    """Rows in (verification_requests, request_claims)."""
+def row_counts(db_path: Path) -> tuple[int, int, int]:
+    """Rows in (verification_requests, request_claims, client_links)."""
     conn = sqlite3.connect(db_path)
     try:
-        requests = conn.execute("SELECT count(*) FROM verification_requests")
-        request_count = int(requests.fetchone()[0])
-        claims = conn.execute("SELECT count(*) FROM request_claims")
-        claim_count = int(claims.fetchone()[0])
+        counts = tuple(
+            int(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+            for table in ("verification_requests", "request_claims", "client_links")
+        )
     finally:
         conn.close()
-    return request_count, claim_count
+    return counts[0], counts[1], counts[2]

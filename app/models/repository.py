@@ -14,8 +14,13 @@ def insert_verification_request(
     business: DemoBusiness,
     claims: Sequence[RequestedClaim],
     created_at: datetime,
+    token_hash: str,
+    expires_at: datetime,
 ) -> str:
-    """Store a request and its claims in one transaction; return the new id."""
+    """Store a request, its claims and its client link in one transaction.
+
+    Only the token's hash is stored, never the token. Returns the new request id.
+    """
     request_id = str(uuid.uuid4())
     with conn:  # commits on success, rolls back everything on any error
         conn.execute(
@@ -24,6 +29,11 @@ def insert_verification_request(
             (request_id, business.id, created_at.isoformat()),
         )
         _insert_claims(conn, request_id, claims)
+        conn.execute(
+            "INSERT INTO client_links (token_hash, request_id, expires_at)"
+            " VALUES (?, ?, ?)",
+            (token_hash, request_id, expires_at.isoformat()),
+        )
     return request_id
 
 

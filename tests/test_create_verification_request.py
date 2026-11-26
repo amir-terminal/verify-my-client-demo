@@ -1,4 +1,4 @@
-"""Tests for POST /verification-requests (spec GH-8, AC1–AC3 and AC7)."""
+"""Tests for POST /verification-requests (spec GH-8, AC1–AC3 and AC7; GH-14 AC1)."""
 
 import logging
 import sqlite3
@@ -40,7 +40,7 @@ def test_create_request_returns_201_with_exact_keys(
 
     assert response.status_code == 201
     body = response.json()
-    assert set(body) == {"id", "claims", "created_at"}
+    assert set(body) == {"id", "claims", "created_at", "client_link", "expires_at"}
     assert uuid.UUID(body["id"]).version == 4
     created_at = datetime.fromisoformat(body["created_at"])
     assert created_at.utcoffset() is not None
@@ -95,7 +95,7 @@ def test_missing_key_401(client: TestClient, db_path: Path) -> None:
 
     assert response.status_code == 401
     assert response.json() == UNAUTHORISED
-    assert row_counts(db_path) == (0, 0)
+    assert row_counts(db_path) == (0, 0, 0)
 
 
 @pytest.mark.parametrize("key", ["demo-key-nobody", "DEMO-KEY-SOLICITOR", ""])
@@ -110,7 +110,7 @@ def test_unknown_key_401(client: TestClient, key: str) -> None:
 def test_401_stores_nothing(client: TestClient, db_path: Path, key: str | None) -> None:
     post(client, FULL_BODY, key)
 
-    assert row_counts(db_path) == (0, 0)
+    assert row_counts(db_path) == (0, 0, 0)
 
 
 # AC3: invalid claims → 422, nothing stored
@@ -144,7 +144,7 @@ def test_invalid_body_422_stores_nothing(
     response = post(client, body)
 
     assert response.status_code == 422
-    assert row_counts(db_path) == (0, 0)
+    assert row_counts(db_path) == (0, 0, 0)
 
 
 def test_non_json_body_422_stores_nothing(client: TestClient, db_path: Path) -> None:
@@ -155,7 +155,7 @@ def test_non_json_body_422_stores_nothing(client: TestClient, db_path: Path) -> 
     )
 
     assert response.status_code == 422
-    assert row_counts(db_path) == (0, 0)
+    assert row_counts(db_path) == (0, 0, 0)
 
 
 def test_expected_value_stored_trimmed(client: TestClient, db_path: Path) -> None:
@@ -184,7 +184,7 @@ def test_bad_key_with_bad_body_stores_nothing(
     response = post(client, {"claims": [{"type": "passport"}]}, key="demo-key-nobody")
 
     assert response.status_code in (401, 422)
-    assert row_counts(db_path) == (0, 0)
+    assert row_counts(db_path) == (0, 0, 0)
 
 
 # AC7: no personal data in logs

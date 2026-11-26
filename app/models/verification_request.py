@@ -65,10 +65,15 @@ class CreateVerificationRequest(BaseModel):
 
 
 class VerificationRequestCreated(BaseModel):
-    """Response of POST /verification-requests: no expected values, no business."""
+    """Response of POST /verification-requests: no expected values, no business.
+
+    `client_link` carries the raw token: this response is the only place it appears.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     id: str
     claims: list[ClaimType]
     created_at: str
+    client_link: str
+    expires_at: str
