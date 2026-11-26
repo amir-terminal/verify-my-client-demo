@@ -2,7 +2,7 @@
 
 - **Issue:** #14 (slice 1b of epic #7, split out of #8 at G2) · **Epic brief:** [docs/epics/GH-7-core-flow.md](../epics/GH-7-core-flow.md) · **Assessment:** [docs/assessments/GH-7-core-flow.md](../assessments/GH-7-core-flow.md) (risk R2) · **ADRs:** [0002](../decisions/0002-python-quality-tooling.md), [0003](../decisions/0003-core-flow-storage-and-data-handling.md) · **Builds on:** #8 ([spec](GH-8-create-verification-request.md), merged in PR #16)
 - **Status:** Draft · **Approved by:** – on –
-- **Protected areas:** `**/links/**`, `**/models/**`, `**/migrations/**`, and `app/api/**` once the owner adds it (it isn't in `protected_paths` on `main` yet, see §9) → `human-review`. The owner reviews the code at G3, and this slice can't take the no-UAT lane.
+- **Protected areas:** `**/links/**`, `**/models/**`, `**/migrations/**` and `app/api/**` (added to `protected_paths` in PR #17) → `human-review`. The owner reviews the code at G3, and this slice can't take the no-UAT lane.
 - **Blocked by:** #8 (Done) · **Blocks:** #9
 
 ## 1. Goal
@@ -60,6 +60,11 @@ After #8 a business can create a verification request, but has nothing to send i
 - When the app's routes are listed
 - Then they are still exactly `GET /health`, `POST /verification-requests` and FastAPI's docs routes. There's no `/client/…` route yet (#9). 401 and 422 behaviour from #8 is unchanged. `make check` passes, strictly typed, with no new exclusions.
 
+**AC9: The response carrying the token isn't cached**
+- Given a request is created
+- When the 201 response is returned
+- Then it has the header `Cache-Control: no-store`, so browsers and proxies keep no copy of the token (owner's G2 answer, 2026-11-26).
+
 ## 4. Out of scope
 - `GET /client/{token}` and checking expiry or "used" (#9). Consent and setting `used_at` (#10).
 - Redacting tokens from the access log (ADR 0003: required from #9, the first route with a token in its path). This slice's only route has no token in its path.
@@ -77,7 +82,7 @@ After #8 a business can create a verification request, but has nothing to send i
   | `app/migrations/0002_client_links.sql` | The `client_links` table (below); `PRAGMA user_version = 2` | yes |
   | `app/models/repository.py` (changed) | `insert_verification_request(conn, business, claims, created_at, token_hash, expires_at) -> str`: also inserts the link row, **inside the same `with conn:` transaction** | yes |
   | `app/models/verification_request.py` (changed) | `VerificationRequestCreated` gains `client_link: str` and `expires_at: str` | yes |
-  | `app/api/verification_requests.py` (changed) | Takes `now: datetime = Depends(utc_now)` and `request: Request`. Uses `now` for `created_at` (replacing `datetime.now(UTC)`), computes `expires_at = now + LINK_LIFETIME`, makes the token, stores only `hash_token(token)`, and builds `client_link = f"{request.base_url}client/{token}"`. The raw token lives only in a local variable and the response | `app/api/**` (once added) |
+  | `app/api/verification_requests.py` (changed) | Takes `now: datetime = Depends(utc_now)`, `request: Request` and `response: Response`, and sets `response.headers["Cache-Control"] = "no-store"` (AC9). Uses `now` for `created_at` (replacing `datetime.now(UTC)`), computes `expires_at = now + LINK_LIFETIME`, makes the token, stores only `hash_token(token)`, and builds `client_link = f"{request.base_url}client/{token}"`. The raw token lives only in a local variable and the response | yes (`app/api/**`) |
   | `tests/test_client_link.py` (new); `tests/test_create_verification_request.py`, `tests/test_database.py` (changed) | See §6 | no |
   | `docs/product/ARCHITECTURE.md` (changed) | `app/links/`, the `client_links` table, schema version 2, "the raw token exists only in the 201 response" | no |
 - **Data model (`0002_client_links.sql`, `STRICT`):**
@@ -116,10 +121,11 @@ After #8 a business can create a verification request, but has nothing to send i
 | AC6 | `test_init_schema_sets_latest_user_version` (renamed, 2); `test_version_1_file_upgrades_and_keeps_requests` (build a v1 file with `0001` only and one request, start the app, check version 2 and the row is intact); `test_unknown_schema_version_refuses_start` (existing) | |
 | AC7 | `test_raw_token_never_logged` (`caplog` at DEBUG on the root logger) | Or extend #8's log test |
 | AC8 | `test_routes_are_exactly` (existing, unchanged); the #8 401/422 tests pass unchanged except the `row_counts` extension | |
+| AC9 | `test_201_response_is_not_cached` (`response.headers["cache-control"] == "no-store"`) | |
 
 **UAT outline (owner, about 10 minutes, on `/docs`):**
 1. Keep your `var/verify-my-client.sqlite3` from #8's test, which is at version 1. `make dev`, then `sqlite3 var/verify-my-client.sqlite3 "pragma user_version; select count(*) from verification_requests;"` → version 2, and your #8 requests are still there.
-2. **Authorize** with `demo-key-solicitor` and POST the full body from #8 → 201 with five keys, including `client_link` (`http://127.0.0.1:8000/client/…`) and `expires_at` exactly 24 hours after `created_at`.
+2. **Authorize** with `demo-key-solicitor` and POST the full body from #8 → 201 with five keys, including `client_link` (`http://127.0.0.1:8000/client/…`) and `expires_at` exactly 24 hours after `created_at`. The response headers include `cache-control: no-store`.
 3. POST again → a different `id` and a different token.
 4. Copy the token (the part after `/client/`), then in a terminal: `printf %s '<token>' | shasum -a 256` and `sqlite3 var/verify-my-client.sqlite3 "select token_hash, expires_at, used_at from client_links;"` → your hash is in the list, the raw token isn't anywhere (`sqlite3 var/verify-my-client.sqlite3 .dump | grep '<token>'` prints nothing), and `used_at` is empty.
 5. Open the `client_link` in a browser → 404. That's expected: opening links is #9.
@@ -134,5 +140,6 @@ After #8 a business can create a verification request, but has nothing to send i
 Not split. Estimate: about 90 lines of app code and SQL, and about 130 lines of tests, so about 220 changed lines, within the 400 target.
 
 ## 9. Open questions
-1. **`app/api/**` isn't protected on `main` yet.** You said you'd run `python3 tools/haam/haam.py config --protected "app/api/**" --human`. It doesn't block this spec: the PR gets `human-review` anyway from `app/links/`, `app/models/` and `app/migrations/`. Running it before the build means the release gate also lists the router.
-2. **`Cache-Control: no-store` on the 201 response?** The response now carries a credential (the token). Recommended: yes, one header and one test, so browsers and proxies don't keep a copy. Not in the ACs above. Say yes and I'll add it as AC9 before you approve.
+None. The owner answered at G2 (2026-11-26):
+1. `app/api/**` is protected: added to `protected_paths` in PR #17, so the release gate lists the router too.
+2. `Cache-Control: no-store` on the 201 response: yes, it's AC9.
