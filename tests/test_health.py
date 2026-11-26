@@ -1,4 +1,4 @@
-"""Tests for GET /health (spec GH-5, AC1 and AC2)."""
+"""Tests for GET /health (spec GH-5, AC1 and AC2) and the route list (spec GH-8, AC8)."""
 
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
@@ -18,7 +18,7 @@ def test_health_returns_ok() -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_only_health_route_is_exposed() -> None:
+def test_routes_are_exactly() -> None:
     other_routes = [
         route for route in app.routes if getattr(route, "path", None) not in DOCS_PATHS
     ]
@@ -30,7 +30,7 @@ def test_only_health_route_is_exposed() -> None:
     }
 
     assert all(isinstance(route, APIRoute) for route in other_routes)
-    assert exposed == {("GET", "/health")}
+    assert exposed == {("GET", "/health"), ("POST", "/verification-requests")}
 
 
 def test_health_rejects_post() -> None:
